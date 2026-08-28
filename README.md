@@ -21,6 +21,7 @@ Anything else (vLLM, Ollama, cloud APIs…) is out of scope — use pi's built-i
 ## Features
 
 - **Multi-machine discovery** — configurable list of servers (host, ports, API key, options); probes all of them at startup and on demand
+- **Compact model ids** — models appear as `Name (host:port)` in pi's `/model` picker, like a native provider; the raw GGUF path/alias is sent to the server automatically on every request
 - **Single-model & router modes** — llama.cpp single-model mode (one GGUF per instance) and router mode (multiple models per server, with per-model status and args)
 - **Per-model metadata badges** — 👁️ vision (mmproj / modalities), 🚀 drafter (speculative decoding), 🗜️ quant tag from GGUF filename, 🧠 KV cache quantization (from server args or `/proc`)
 - **Live Prometheus metrics** — polls `/metrics` (or `/stats`) and renders a compact widget with instantaneous prompt/gen throughput; auto-activates for llamacpp-infra models only
@@ -41,7 +42,7 @@ llamacpp-infra is a [pi package](https://pi.dev/packages): one extension (`src/i
 pi install git:github.com/noguerol/llamacpp-infra
 
 # Pin a tag/commit
-pi install git:github.com/noguerol/llamacpp-infra@v1.1.0
+pi install git:github.com/noguerol/llamacpp-infra@v1.2.0
 
 # From npm
 pi install npm:pi-llamacpp-infra
@@ -119,11 +120,13 @@ Shows every discovered model with metadata badges:
 ```
 📋 Discovered models (8)
 
- 1. local:8080/Qwen3.6-27B-UD-Q3_K_XL   👁️ 🗜️ UD-Q3_K_XL
- 2. local:8081/DeepSeek-V4-Flash          🗜️ ROCMFP2
- 3. myserver:8080/Meta-Llama-3.1-8B       🚀 draft-model   🗜️ Q4_K_M
- 4. myserver:8081/gemma-3-4b-it           👁️ 🗜️ Q4_K_M
+ 1. Qwen3.6-27B-UD-Q3_K_XL (local:8080)   👁️ 🗜️ UD-Q3_K_XL
+ 2. DeepSeek-V4-Flash-ROCMFP2 (local:8081)          🗜️ ROCMFP2
+ 3. Meta-Llama-3.1-8B (myserver:8080)     🚀 draft-model   🗜️ Q4_K_M
+ 4. gemma-3-4b-it (myserver:8081)         👁️ 🗜️ Q4_K_M
 ```
+
+The same compact id is what pi's `/model` picker shows, with the serving machine in parentheses.
 
 ### `/llamacpp-infra status`
 
@@ -181,7 +184,7 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
     "metricsPollMs": 5000
   },
   "modelOptions": {
-    "myserver:8080/Qwen3.6-27B": {
+    "Qwen3.6-27B (myserver:8080)": {
       "thinkingBudgets": {
         "minimal": 256,
         "low": 1024,
@@ -215,7 +218,7 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 | `startupGraceMs` | `40000` | Keep trying at startup while nothing has answered |
 | `knownGoodFailLimit` | `3` | Consecutive failures before a live endpoint is dropped |
 | `detectVision` | `true` | Scan `/proc` for `--mmproj` + read server-reported modalities |
-| `prefixModelIds` | `true` | `host:port/model` format to avoid cross-server collisions |
+| `prefixModelIds` | `true` | Append the machine tag `(host:port)` to model ids; OFF keeps bare names and only disambiguates collisions |
 | `showBadgesInNames` | `true` | Append 👁️🚀💤 badges to model display names |
 | `includeUnloadedRouterModels` | `false` | Router mode: list models that are not currently loaded |
 | `warmup` | `true` | Pre-cache system prompt KV on llama.cpp servers |
@@ -230,7 +233,15 @@ Levels: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
 
 ## Model ID Format
 
-With `prefixModelIds: true` (default), every model ID is `host:port/model`, e.g. `myserver:8080/Qwen3.6-27B-UD-Q3_K_XL`. This avoids collisions when the same GGUF is served on multiple machines. Localhost servers (`127.0.0.1`, `localhost`) use `local:port/model` for readability.
+Models are registered with compact display ids: `ModelName (host:port)`, e.g. `Qwen3.6-27B-UD-Q3_K_XL (myserver:8080)` — the compact model name plus the machine serving it in parentheses, matching how pi shows native provider models. Localhost servers (`127.0.0.1`, `localhost`) use `local:port` in the tag.
+
+pi sends the compact id to the extension's request hook, which transparently rewrites it to the raw server-side id (the GGUF path, alias or router id the server advertised in `/v1/models`) before the request leaves pi. Config keys under `modelOptions` use the compact id; legacy `host:port/model` keys are migrated automatically on the first scan.
+
+With `prefixModelIds: false` the machine tag is omitted (`ModelName`); it is re-added automatically only when two models would otherwise collide.
+
+### Thinking budgets in the UI
+
+llama.cpp-family models are registered as reasoning models, exactly like a native pi provider: the footer shows `ModelName (host:port) • <level>`, the thinking selector offers levels with token estimates, and pi sends the configured `thinking_budget_tokens` budget on each request. Per-model budgets configured in the extension override pi's global per-level budgets.
 
 ## Live Metrics Widget
 

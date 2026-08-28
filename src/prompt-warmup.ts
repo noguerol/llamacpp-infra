@@ -248,6 +248,8 @@ export interface PromptWarmerOptions {
 	cacheFile?: string;
 	/** Devuelve el tipo de servidor ("llamacpp"|"lucebox"|"ds4"|"zinc"|"lmstudio") para una baseUrl. */
 	kindFor?: (baseUrl: string) => string | undefined;
+	/** Mapea el id registrado (compacto) al id crudo que espera el servidor. */
+	requestModelFor?: (modelId: string) => string;
 	/** Callback opcional para eventos de warmup (estado en footer, notify, ...). */
 	onEvent?: (ev: WarmupEvent) => void;
 	/** Log opcional. Por defecto silencioso (no-op); activa con PI_WARMUP_DEBUG=1. */
@@ -351,6 +353,7 @@ export class PromptWarmer {
 	readonly provider: string;
 	private cacheFile: string;
 	private kindFor: (baseUrl: string) => string | undefined;
+	private requestModelFor: (modelId: string) => string;
 	private onEvent?: (ev: WarmupEvent) => void;
 	private log: (msg: string) => void;
 
@@ -368,6 +371,7 @@ export class PromptWarmer {
 		this.cacheFile =
 			opts.cacheFile ?? path.join(homedir(), ".pi", "agent", `warmup-${opts.provider}.json`);
 		this.kindFor = opts.kindFor ?? (() => KIND_LLAMACPP);
+		this.requestModelFor = opts.requestModelFor ?? ((id: string) => id);
 		this.onEvent = opts.onEvent;
 		// Por defecto silencioso: escribir por stderr corrompe el render de la TUI
 		// de pi (trazas sucias en el editor / input box). Solo se loguea con
@@ -389,6 +393,15 @@ export class PromptWarmer {
 			return this.kindFor(baseUrl);
 		} catch {
 			return undefined;
+		}
+	}
+
+	/** Id crudo que espera el servidor para un id registrado (con fallback). */
+	private resolveRequestModel(modelId: string): string {
+		try {
+			return this.requestModelFor(modelId) || modelId;
+		} catch {
+			return modelId;
 		}
 	}
 
@@ -422,7 +435,7 @@ export class PromptWarmer {
 		let body: WarmupBody;
 		if (tpl) {
 			body = {
-				model: tpl.model,
+				model: this.resolveRequestModel(tpl.model),
 				messages: [...tpl.systemMessages, { role: "user", content: PLACEHOLDER_USER }],
 				max_tokens: 1,
 				temperature: 0,
@@ -432,7 +445,7 @@ export class PromptWarmer {
 			if (cachePromptSupported(tpl.kind)) body.cache_prompt = true;
 		} else if (systemPrompt && FALLBACK_ENABLED) {
 			body = {
-				model: model.id,
+				model: this.resolveRequestModel(model.id),
 				messages: [
 					{ role: "system", content: systemPrompt },
 					{ role: "user", content: PLACEHOLDER_USER },

@@ -51,6 +51,9 @@
  * 9. LM Studio support: discovers `/v1/models`, enriches metadata from
  *    `/api/v1/models` or legacy `/api/v0/models`, and avoids llama.cpp-only
  *    request fields such as `cache_prompt` / `thinking_budget_tokens`.
+ * 10. Compact model ids: models are registered as "Name (host:port)" — the
+ *    raw server-side model id (GGUF path / alias) is restored automatically
+ *    in before_provider_request before the request leaves pi.
  *
  * HISTORY
  * -------
@@ -1054,6 +1057,8 @@ interface PiModel {
 	compat?: ReturnType<typeof makeCompat>;
 	headers?: Record<string, string>;
 	thinkingBudgets?: ThinkingBudgets;
+	/** Raw model id expected by the server (compact ids are display-only). */
+	serverModelId: string;
 	/** Metadata badges are applied to the name at build time. */
 	endpoint: { serverId: string; host: string; port: number; kind: ServerKind | "unknown" | "auto"; mode: ServerMode };
 	quant?: string;
@@ -1086,8 +1091,9 @@ function toPiModel(
 ): PiModel {
 	const rawId = String(model.id ?? "");
 	const hostPort = `${idSafeHost(srv.host)}:${ep.port}`;
-	const usePrefix = settings.prefixModelIds;
-	const prefixId = (id: string) => `${hostPort}/${id.replace(/^\/+/, "")}`;
+	// Compact display id: "ModelName (host:port)". The raw server-side id is
+	// kept separately (serverModelId) and restored in before_provider_request.
+	const machineTag = settings.prefixModelIds ? ` (${hostPort})` : "";
 	const kind = ep.server;
 
 	const common = {
@@ -1108,10 +1114,10 @@ function toPiModel(
 		const info = model.lmStudio;
 		const contextWindow = lmStudioContextLength(info) ?? model.context_window ?? model.context_length ?? 32768;
 		const displayName = info?.display_name ? cleanModelName(info.display_name) : cleanModelName(rawId);
-		const modelId = usePrefix ? prefixId(rawId) : rawId;
 		return {
 			...common,
-			id: modelId,
+			id: `${displayName}${machineTag}`,
+			serverModelId: rawId,
 			name: `${displayName}${badgeSuffix(modelMeta, settings.showBadgesInNames)}`,
 			// LM Studio exposes reasoning-capable models, but its OpenAI-compatible
 			// endpoint does not use llama.cpp's thinking_budget_tokens field.
@@ -1128,16 +1134,16 @@ function toPiModel(
 		const alias = ep.props?.model_alias || rawId;
 		const nCtx = ep.props?.default_generation_settings?.n_ctx;
 		const contextWindow = model.context_length ?? nCtx ?? 8192;
-		const budgets = config_ModelOptions()?.[usePrefix ? prefixId(alias) : alias]?.thinkingBudgets;
+		const displayName = cleanModelName(baseName(alias !== rawId ? alias : modelPath));
 		return {
 			...common,
-			id: usePrefix ? prefixId(alias) : alias,
-			name: `${cleanModelName(modelPath)}${badgeSuffix(modelMeta, settings.showBadgesInNames)}`,
+			id: `${displayName}${machineTag}`,
+			serverModelId: alias,
+			name: `${displayName}${badgeSuffix(modelMeta, settings.showBadgesInNames)}`,
 			reasoning: ep.props?.capabilities?.reasoning_supported ?? true,
 			contextWindow,
 			maxTokens: model.max_tokens ?? Math.min(contextWindow, 8192),
 			compat: makeCompat(kind),
-			...(budgets ? { thinkingBudgets: budgets } : {}),
 		};
 	}
 
@@ -1153,21 +1159,19 @@ function toPiModel(
 	const contextWindow =
 		model.meta?.n_ctx ?? model.meta?.n_ctx_train ?? model.context_window ?? model.context_length ?? 32768;
 
-	// Models with configured thinking budgets must be registered as reasoning
-	// models so pi's thinking-level machinery (and budget field) engages.
-	const modelId = usePrefix ? prefixId(rawId) : rawId;
-	const budgets = config_ModelOptions()?.[modelId]?.thinkingBudgets;
 	const isLlamaFamily = kind === "llamacpp";
 
 	return {
 		...common,
-		id: modelId,
+		id: `${displayName}${machineTag}`,
+		serverModelId: rawId,
 		name: `${displayName}${badgeSuffix(modelMeta, settings.showBadgesInNames)}`,
-		reasoning: isLlamaFamily || Boolean(budgets),
+		// llama.cpp-family models behave like native pi reasoning models: the
+		// footer shows the thinking level and pi sends the configured budget.
+		reasoning: isLlamaFamily,
 		contextWindow,
 		maxTokens: model.max_tokens ?? Math.min(contextWindow, 8192),
 		compat: makeCompat(kind),
-		...(budgets ? { thinkingBudgets: budgets } : {}),
 	};
 }
 
@@ -1317,6 +1321,22 @@ const zincModelIds = new Set<string>();
 const modelBaseUrls = new Map<string, string>();
 /** baseUrl → server kind (for the warmup request profile). */
 const endpointKinds = new Map<string, string>();
+/** Registered (compact) model id → raw server-side model id (payload rewrite). */
+const serverModelIds = new Map<string, string>();
+/** Raw server-side model id → registered (compact) model id. */
+const compactModelIds = new Map<string, string>();
+
+/** Compact id registered in pi for a raw server model id (or the input). */
+function compactIdFor(modelId: string | undefined): string | undefined {
+	if (!modelId) return undefined;
+	return compactModelIds.get(modelId) ?? modelId;
+}
+
+/** Raw server-side id to send in requests for a registered model id (or the input). */
+function rawIdFor(modelId: string | undefined): string | undefined {
+	if (!modelId) return undefined;
+	return serverModelIds.get(modelId) ?? modelId;
+}
 
 /**
  * Build pi models from a scan and (re)register the provider.
@@ -1324,7 +1344,10 @@ const endpointKinds = new Map<string, string>();
  */
 function buildAndRegisterProvider(pi: ExtensionAPI, scan: ScanResult, config: InfraConfig): PiModel[] {
 	zincModelIds.clear();
+	serverModelIds.clear();
+	compactModelIds.clear();
 	const settings = config.settings;
+	let configDirty = false;
 
 	const piModels: PiModel[] = [];
 	const seenIds = new Set<string>();
@@ -1354,24 +1377,55 @@ function buildAndRegisterProvider(pi: ExtensionAPI, scan: ScanResult, config: In
 			const rawId = String(model.id ?? "");
 			const modelMeta = ep.meta.get(rawId) ?? {};
 			const pm = toPiModel(model, ep, srv, settings, modelMeta);
+			const hostPort = `${idSafeHost(srv.host)}:${ep.port}`;
 
-			// ID collision guard: force the "host:port/" prefix on collisions,
-			// then a numeric suffix if even that collides.
+			// ID collision guard: add the machine tag, then a numeric suffix.
 			if (seenIds.has(pm.id)) {
-				pm.id = `${idSafeHost(srv.host)}:${ep.port}/${pm.id.replace(/^\/+/, "")}`;
+				if (!pm.id.includes(`(${hostPort})`)) pm.id = `${pm.id} (${hostPort})`;
 				let n = 2;
 				while (seenIds.has(pm.id)) pm.id = `${pm.id}-${n++}`;
 			}
 			seenIds.add(pm.id);
 
+			// Thinking budgets: resolve by the registered (compact) id or legacy
+			// "host:port/model" keys, then migrate legacy keys forward.
+			const opts = config_ModelOptions();
+			let budgets = opts[pm.id]?.thinkingBudgets;
+			if (!budgets) {
+				for (const legacyKey of [`${hostPort}/${pm.serverModelId.replace(/^\/+/, "")}`, pm.serverModelId]) {
+					const entry = opts[legacyKey];
+					if (entry?.thinkingBudgets) {
+						if (!opts[pm.id]) opts[pm.id] = entry;
+						delete opts[legacyKey]; // migrate: compact id replaces host:port/model
+						configDirty = true;
+						budgets = entry.thinkingBudgets;
+						break;
+					}
+				}
+			}
+			if (budgets && ep.server !== "lmstudio") {
+				pm.thinkingBudgets = budgets;
+				// Models with configured thinking budgets must be registered as
+				// reasoning models so pi's thinking-level machinery engages.
+				pm.reasoning = true;
+			}
+
+			// Duplicate display names within one endpoint get the raw id appended.
 			const candidateName = cleanModelName(String(model.name ?? model.id));
 			if (nameCount.get(candidateName)! > 1) {
-				pm.name = `${candidateName}${badgeSuffix(modelMeta, settings.showBadgesInNames)} (${rawId})`;
+				pm.name = `${candidateName}${badgeSuffix(modelMeta, settings.showBadgesInNames)} (${pm.serverModelId})`;
 			}
 			piModels.push(pm);
-			if (ep.server === "zinc") zincModelIds.add(pm.id);
+			if (ep.server === "zinc") {
+				zincModelIds.add(pm.id);
+				zincModelIds.add(pm.serverModelId);
+			}
+			serverModelIds.set(pm.id, pm.serverModelId);
+			if (!compactModelIds.has(pm.serverModelId)) compactModelIds.set(pm.serverModelId, pm.id);
 		}
 	}
+
+	if (configDirty) saveConfig(config);
 
 	// Maps for hooks
 	endpointKinds.clear();
@@ -1442,6 +1496,7 @@ export default function (pi: ExtensionAPI) {
 		provider: PROVIDER_NAME,
 		cacheFile: join(homedir(), ".pi", "agent", "warmup-llamacpp-infra.json"),
 		kindFor: (baseUrl) => endpointKinds.get(baseUrl),
+		requestModelFor: (modelId) => rawIdFor(modelId) ?? modelId,
 		onEvent: (ev) => warmupStatus.handle(ev),
 	});
 
@@ -1748,6 +1803,21 @@ export default function (pi: ExtensionAPI) {
 	registerEmptyProvider();
 	void discoverAndRegister().then((r) => schedulePolling(r.shouldPoll));
 
+	// ── Hook 0: compact registered id → raw server model id ─────────
+	// Model ids registered in pi are compact display ids ("Name (host:port)");
+	// llama.cpp-family servers expect the raw model path/alias they advertised
+	// in /v1/models, so the payload model field is rewritten here. Registered
+	// first so every later hook (and the server) sees the raw id.
+	pi.on("before_provider_request", (event, _ctx) => {
+		const payload = event.payload as Record<string, unknown>;
+		const modelInPayload = typeof payload.model === "string" ? payload.model : undefined;
+		if (!modelInPayload) return undefined;
+		const raw = serverModelIds.get(modelInPayload);
+		if (raw === undefined || raw === modelInPayload) return undefined;
+		debugLog(`model id "${modelInPayload}" → "${raw}"`);
+		return { ...payload, model: raw };
+	});
+
 	// ── Hook 1: ZINC payload workaround ────────────────────────────
 	// ZINC rejects non-empty model ids and is picky about tool formats.
 	function isZincModel(modelInPayload: unknown): boolean {
@@ -1799,20 +1869,23 @@ export default function (pi: ExtensionAPI) {
 	// ── Hook 2: per-model thinking budget (llama.cpp thinking_budget_tokens) ──
 	// pi injects thinking_token budgets from its global settings; this hook
 	// overrides the value with the per-model budgets configured for this model.
-	// Registered after the ZINC hook so it sees the final payload.
+	// Registered after the ZINC hook so it sees the final payload. Hook 0 has
+	// already rewritten the payload model to the raw server id, so both raw
+	// and compact ids are resolved against the registered model maps.
 	pi.on("before_provider_request", (event, ctx) => {
 		const payload = event.payload as Record<string, unknown>;
 		const modelId = typeof payload.model === "string" ? payload.model : undefined;
 		if (!modelId) return undefined;
-		const baseUrl = modelBaseUrls.get(modelId);
+		const compactKey = compactModelIds.get(modelId) ?? modelId;
+		const baseUrl = modelBaseUrls.get(compactKey);
 		if (!supportsThinkingBudget(endpointKinds.get(baseUrl ?? "") as ServerKind | undefined)) return undefined;
-		const budgets = config.modelOptions[modelId]?.thinkingBudgets;
+		const budgets = config.modelOptions[compactKey]?.thinkingBudgets;
 		if (!budgets) return undefined;
 		const level = normalizeLevel(ctx.thinkingLevel ?? currentThinkingLevel);
 		if (!level) return undefined;
 		const value = budgets[level];
 		if (typeof value !== "number") return undefined;
-		debugLog(`thinking budget for ${modelId} [${level}] = ${value}`);
+		debugLog(`thinking budget for ${compactKey} [${level}] = ${value}`);
 		return { ...payload, [THINKING_BUDGET_FIELD]: value };
 	});
 
@@ -1832,12 +1905,16 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// ── Hook 3: header warmup capture (runs last, sees final payload) ──
+	// Templates are keyed by the compact registered id (the same id passed to
+	// warmupForModel); PromptWarmer re-resolves the raw server id per request.
 	pi.on("before_provider_request", (event, ctx) => {
 		if (!config.settings.warmup) return undefined;
 		const payload = event.payload as Record<string, unknown>;
 		const modelId = typeof payload?.model === "string" ? payload.model : undefined;
-		const baseUrl = modelId ? modelBaseUrls.get(modelId) : undefined;
-		warmer.onProviderPayload(payload, baseUrl, ctx.cwd);
+		const compactKey = modelId ? (compactModelIds.get(modelId) ?? modelId) : undefined;
+		const baseUrl = compactKey ? modelBaseUrls.get(compactKey) : undefined;
+		const capturePayload = compactKey ? { ...payload, model: compactKey } : payload;
+		warmer.onProviderPayload(capturePayload, baseUrl, ctx.cwd);
 		return undefined;
 	});
 
@@ -1949,7 +2026,7 @@ export default function (pi: ExtensionAPI) {
 			if (!ep) return undefined;
 			// Find the raw entry whose registered id ends with the raw id fragment.
 			for (const [rawId, meta] of ep.meta) {
-				if (m.id.endsWith(`/${rawId.replace(/^\/+/, "")}`) || m.id === rawId) return meta;
+				if (m.serverModelId === rawId || m.id === rawId) return meta;
 			}
 			return undefined;
 		};
@@ -2041,6 +2118,8 @@ export default function (pi: ExtensionAPI) {
 							"ZINC, DwarfStar (ds4-server), lucebox and LM Studio on any number",
 							"of machines, and registers them into pi's native /model list.",
 							"",
+							"Models appear as compact ids: \"Name (host:port)\" — the raw GGUF",
+							"path/alias is sent to the server automatically on every request.",
 							"LM Studio uses its OpenAI-compatible /v1 endpoint and enriches",
 							"metadata from /api/v1/models (or legacy /api/v0/models).",
 							"Per-model metadata: vision, drafter, model quant, KV cache quant.",
