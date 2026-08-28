@@ -1,0 +1,37 @@
+{
+  "name": "pi-llamacpp-infra",
+  "version": "1.0.0",
+  "description": "Discovery, metrics and control of llama.cpp-family servers for pi: probes any number of machines (localhost, LAN, Tailscale), registers every model into pi's native /model list, and provides live Prometheus metrics, per-model thinking budgets, vision detection and a native config UI. Supports llama.cpp, ZINC, DwarfStar/ds4 and lucebox.",
+  "keywords": [
+    "pi-package",
+    "llamacpp",
+    "llama.cpp",
+    "local-models",
+    "discovery",
+    "metrics",
+    "tailscale",
+    "vision",
+    "thinking"
+  ],
+  "author": "Javier Noguerol <https://github.com/noguerol>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/noguerol/llamacpp-infra"
+  },
+  "homepage": "https://github.com/noguerol/llamacpp-infra",
+  "bugs": {
+    "url": "https://github.com/noguerol/llamacpp-infra/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
