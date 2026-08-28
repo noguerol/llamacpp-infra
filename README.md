@@ -1,6 +1,6 @@
-# llamacpp-infra — Discovery, Metrics & Control for llama.cpp Servers
+# llamacpp-infra — Discovery, Metrics & Control for llama.cpp-family Servers
 
-**llamacpp-infra** turns pi into a first-class citizen of local llama.cpp infrastructure. It probes any number of machines — localhost, LAN or Tailscale — discovers every model served by llama.cpp and its variants, registers them into pi's native `/model` list, and gives you live Prometheus metrics, per-model thinking budgets, vision detection and a full configuration UI — all without leaving the pi prompt.
+**llamacpp-infra** turns pi into a first-class citizen of local llama.cpp infrastructure. It probes any number of machines — localhost, LAN or Tailscale — discovers every model served by llama.cpp and its variants (including LM Studio), registers them into pi's native `/model` list, and gives you live Prometheus metrics, per-model thinking budgets, vision detection and a full configuration UI — all without leaving the pi prompt.
 
 ---
 
@@ -14,8 +14,9 @@ Every endpoint llamacpp-infra talks to runs llama.cpp or a direct variant:
 | **ZINC** | `owned_by: "zinc"` | Payload workaround: empty model field + tool normalization |
 | **DwarfStar / ds4** | Opt-in ping to `/v1/chat/completions` | antirez's ds4-server for DeepSeek V4 (per-server `probeDs4` flag) |
 | **lucebox** | `GET /props` with `server.name: "luce-*"` | DeepSeek dflash server with rich metadata |
+| **LM Studio** | `GET /v1/models` + optional `/api/v1/models` metadata | Local OpenAI-compatible server backed by llama.cpp; default port `1234` |
 
-Anything else (LM Studio, vLLM, Ollama, cloud APIs…) is out of scope — use pi's built-in providers for those.
+Anything else (vLLM, Ollama, cloud APIs…) is out of scope — use pi's built-in providers for those.
 
 ## Features
 
@@ -25,6 +26,7 @@ Anything else (LM Studio, vLLM, Ollama, cloud APIs…) is out of scope — use p
 - **Live Prometheus metrics** — polls `/metrics` (or `/stats`) and renders a compact widget with instantaneous prompt/gen throughput; auto-activates for llamacpp-infra models only
 - **Thinking budgets** — llama.cpp accepts `thinking_budget_tokens` per request; configure budgets per thinking level (minimal/low/medium/high/xhigh/max) per model; models with budgets are registered with reasoning enabled
 - **Header warmup** — pre-caches the system prompt KV on llama.cpp-family servers so the first real request is faster
+- **LM Studio support** — uses LM Studio's OpenAI-compatible `/v1` API, enriches names/context/quant/vision from `/api/v1/models` (or legacy `/api/v0/models`), and avoids llama.cpp-only request fields
 - **ZINC workaround** — ZINC rejects non-empty model IDs; the payload hook rewrites the request and normalizes tool definitions automatically
 - **Vision detection** — scans `/proc` for local llama-server processes launched with `--mmproj` and marks those models as image-capable; also reads server-reported `modalities` / `input_modalities`
 - **Native configuration UI** — everything configurable through `/llamacpp-infra config` with pi's native menus; no config file editing required
@@ -39,7 +41,7 @@ llamacpp-infra is a [pi package](https://pi.dev/packages): one extension (`src/i
 pi install git:github.com/noguerol/llamacpp-infra
 
 # Pin a tag/commit
-pi install git:github.com/noguerol/llamacpp-infra@v1.0.0
+pi install git:github.com/noguerol/llamacpp-infra@v1.1.0
 
 # From npm
 pi install npm:pi-llamacpp-infra
@@ -58,17 +60,32 @@ pi remove npm:pi-llamacpp-infra
 
 > **Security:** pi packages run with full system access. Install only packages you trust and review the source.
 
-**Requirements:** a working pi installation and at least one llama.cpp-family server running somewhere accessible (localhost, LAN or Tailscale).
+**Requirements:** a working pi installation and at least one llama.cpp-family server running somewhere accessible (localhost, LAN or Tailscale). LM Studio works when its local server is started (Developer tab or `lms server start`, usually on `http://localhost:1234/v1`).
 
 ## Quick Start
 
 ```
-/llamacpp-infra config      # open the config menu → add your first server
+/llamacpp-infra config      # open the config menu → add your first server (LM Studio: port 1234)
 /llamacpp-infra scan        # discover models now
 /llamacpp-infra list        # see what was found
 ```
 
 That's it. On the next pi startup, llamacpp-infra probes your servers automatically and registers every model into `/model`. Switch models with `/model` as usual.
+
+### LM Studio quick setup
+
+LM Studio exposes an OpenAI-compatible API on `/v1` (default `http://localhost:1234/v1`) and a richer local REST API for model metadata on `/api/v1/models` (older LM Studio versions used `/api/v0/models`). llamacpp-infra probes `/v1/models` as the source of usable model IDs and, when available, enriches them with LM Studio's context length, display name, quantization and vision capability.
+
+```bash
+# Start LM Studio's local server (or use the Developer tab in the GUI)
+lms server start
+
+# In pi: add/select host 127.0.0.1 with port 1234, then scan
+/llamacpp-infra config
+/llamacpp-infra scan
+```
+
+No special payload workaround is required: LM Studio accepts standard OpenAI chat-completions requests. llamacpp-infra deliberately does **not** send llama.cpp-only fields such as `cache_prompt` or `thinking_budget_tokens` to LM Studio.
 
 ## Commands
 
@@ -135,7 +152,7 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
       "id": "local",
       "host": "127.0.0.1",
       "label": "Local",
-      "ports": [8000, 8001, 8002, 8080, 8081, 8082],
+      "ports": [8000, 8001, 8002, 8080, 8081, 8082, 1234],
       "enabled": true,
       "probeDs4": false
     },
@@ -183,7 +200,7 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 | `id` | required | Unique short id (used in model IDs and logs) |
 | `host` | required | Hostname, tailnet name or IP |
 | `label` | `host` | Friendly name shown in menus |
-| `ports` | required | Array of ports to probe |
+| `ports` | required | Array of ports to probe (`1234` is LM Studio's usual local server port) |
 | `enabled` | `true` | Whether to probe this server |
 | `probeDs4` | `false` | Opt-in: ping `/v1/chat/completions` for DwarfStar/ds4 servers |
 | `apiKey` | — | Optional bearer token sent on discovery and per-model requests |
@@ -233,13 +250,13 @@ llamacpp-infra/
 ├── LICENSE             # MIT
 ├── README.md
 └── src/
-    ├── index.ts        # Extension entry point (~2400 lines)
+    ├── index.ts        # Extension entry point (~2600 lines)
     └── prompt-warmup.ts # Header warmup module (inlined, ~600 lines)
 ```
 
 Two-file extension with zero external dependencies (only pi's bundled `@earendil-works/pi-coding-agent` + Node built-ins):
 
-- **Discovery engine** — multi-server probing with timeouts, retry budgets, and per-server kind detection (llama.cpp, ZINC, DwarfStar, lucebox)
+- **Discovery engine** — multi-server probing with timeouts, retry budgets, and per-server kind detection (llama.cpp, ZINC, DwarfStar, lucebox, LM Studio)
 - **Router support** — single-model and multi-model llama.cpp modes with per-model status, args parsing and metadata extraction
 - **Metrics subsystem** — Prometheus endpoint discovery, polling, and compact widget rendering
 - **Thinking budgets** — per-model per-level configuration with automatic `reasoning` registration

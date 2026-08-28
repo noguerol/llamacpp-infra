@@ -1,10 +1,9 @@
-console.error("[llamacpp-infra-load-test] module executed");
 /**
  * extension: llamacpp-infra
  * =========================
  * Discovery, metrics and control of models served by llama.cpp and its
- * variants (ZINC, DwarfStar/ds4, lucebox, OpenAI-compatible forks) on any
- * number of machines — localhost, LAN or Tailscale.
+ * variants (ZINC, DwarfStar/ds4, lucebox, LM Studio) on any number of
+ * machines — localhost, LAN or Tailscale.
  *
  * SCOPE
  * -----
@@ -16,8 +15,9 @@ console.error("[llamacpp-infra-load-test] module executed");
  *   ZINC        — llama.cpp-compatible runtime (owned_by: "zinc")
  *   DwarfStar   — antirez's ds4-server for DeepSeek V4 (chat ping probe)
  *   lucebox     — DeepSeek dflash server (rich /props metadata)
+ *   LM Studio   — local OpenAI-compatible server backed by llama.cpp
  *
- * Anything else (LM Studio, vLLM, Ollama, cloud APIs…) is out of scope.
+ * Anything else (vLLM, Ollama, cloud APIs…) is out of scope.
  *
  * FEATURES
  * --------
@@ -48,6 +48,9 @@ console.error("[llamacpp-infra-load-test] module executed");
  * 7. Header warmup (pre-cache system prompt KV on llama.cpp-family servers).
  * 8. ZINC workaround: ZINC rejects non-empty model ids; the payload hook
  *    rewrites the request accordingly and normalizes tool definitions.
+ * 9. LM Studio support: discovers `/v1/models`, enriches metadata from
+ *    `/api/v1/models` or legacy `/api/v0/models`, and avoids llama.cpp-only
+ *    request fields such as `cache_prompt` / `thinking_budget_tokens`.
  *
  * HISTORY
  * -------
@@ -150,6 +153,37 @@ interface LlamaCppMeta {
 	n_ctx_train?: number;
 }
 
+interface LmStudioModelInfo {
+	/** v1 REST API unique key; v0 uses `id` instead. */
+	key?: string;
+	id?: string;
+	display_name?: string;
+	/** v1: "llm" | "embedding"; v0: "llm" | "vlm" | "embeddings". */
+	type?: string;
+	publisher?: string;
+	architecture?: string | null;
+	arch?: string | null;
+	format?: string | null;
+	compatibility_type?: string | null;
+	quantization?: string | { name?: string | null; bits_per_weight?: number | null } | null;
+	state?: string;
+	max_context_length?: number;
+	loaded_instances?: Array<{ id?: string; config?: { context_length?: number; parallel?: number } }>;
+	capabilities?: {
+		vision?: boolean;
+		trained_for_tool_use?: boolean;
+		reasoning?: boolean | { allowed_options?: string[]; default?: string };
+	};
+	selected_variant?: string;
+	variants?: string[];
+}
+
+interface LmStudioModelsResponse {
+	models?: LmStudioModelInfo[];
+	data?: LmStudioModelInfo[];
+	object?: string;
+}
+
 interface LlamaCppModel {
 	id: string;
 	name?: string;
@@ -171,6 +205,8 @@ interface LlamaCppModel {
 		input_modalities?: string[];
 		output_modalities?: string[];
 	};
+	/** LM Studio REST metadata, when the local server exposes it. */
+	lmStudio?: LmStudioModelInfo;
 	meta?: LlamaCppMeta;
 	context_window?: number;
 	context_length?: number;
@@ -211,7 +247,7 @@ interface ServerProps {
 	cache_type_v?: string;
 }
 
-type ServerKind = "llamacpp" | "zinc" | "lucebox" | "dwarfstar";
+type ServerKind = "llamacpp" | "zinc" | "lucebox" | "dwarfstar" | "lmstudio";
 type ServerMode = "single" | "router" | "unknown";
 
 /** Per-model metadata extracted during discovery. */
@@ -296,7 +332,7 @@ const DEFAULT_SERVERS: ServerConfig[] = [
 		id: "local",
 		host: "127.0.0.1",
 		label: "Local",
-		ports: [8000, 8001, 8002, 8080, 8081, 8082],
+		ports: [8000, 8001, 8002, 8080, 8081, 8082, 1234],
 		enabled: true,
 		probeDs4: false,
 	},
@@ -682,22 +718,109 @@ async function fetchServerProps(
 	return undefined;
 }
 
+function lmStudioKey(info: LmStudioModelInfo): string | undefined {
+	return info.key ?? info.id;
+}
+
+function lmStudioQuantName(info: LmStudioModelInfo | undefined): string | undefined {
+	if (!info) return undefined;
+	const q = info.quantization;
+	if (typeof q === "string") return q || undefined;
+	return q?.name ?? undefined;
+}
+
+function lmStudioContextLength(info: LmStudioModelInfo | undefined): number | undefined {
+	if (!info) return undefined;
+	const loadedCtx = info.loaded_instances?.find((inst) => typeof inst.config?.context_length === "number")?.config?.context_length;
+	return loadedCtx ?? info.max_context_length;
+}
+
+function isLmStudioModelInfo(value: unknown): value is LmStudioModelInfo {
+	const m = value as LmStudioModelInfo | undefined;
+	if (!m || typeof m !== "object") return false;
+	return Boolean(
+		m.key ||
+		m.id ||
+		m.display_name ||
+		m.compatibility_type ||
+		m.format ||
+		m.loaded_instances ||
+		typeof m.max_context_length === "number" ||
+		m.capabilities,
+	);
+}
+
+async function fetchLmStudioCatalog(
+	baseUrl: string,
+	timeoutMs: number,
+	apiKey?: string,
+): Promise<LmStudioModelInfo[] | undefined> {
+	const rootUrl = baseUrl.replace(/\/v1\/?$/, "");
+	// LM Studio v1 is current; v0 is still common in older installations.
+	for (const path of ["/api/v1/models", "/api/v0/models"]) {
+		try {
+			const { status, body } = await httpGet(`${rootUrl}${path}`, timeoutMs, apiKey);
+			if (status < 200 || status >= 300) continue;
+			const payload = JSON.parse(body) as LmStudioModelsResponse;
+			const models = Array.isArray(payload.models) ? payload.models : Array.isArray(payload.data) ? payload.data : undefined;
+			if (models && models.length > 0 && models.some(isLmStudioModelInfo)) return models;
+		} catch {
+			// Not LM Studio, or an older server without the REST metadata endpoint.
+		}
+	}
+	return undefined;
+}
+
+function buildLmStudioCatalogMap(catalog: LmStudioModelInfo[]): Map<string, LmStudioModelInfo> {
+	const map = new Map<string, LmStudioModelInfo>();
+	const add = (key: string | undefined, info: LmStudioModelInfo) => {
+		const k = key?.trim().toLowerCase();
+		if (k && !map.has(k)) map.set(k, info);
+	};
+	for (const info of catalog) {
+		add(lmStudioKey(info), info);
+		add(info.key, info);
+		add(info.id, info);
+		add(info.selected_variant, info);
+		add(info.display_name, info);
+		for (const variant of info.variants ?? []) add(variant, info);
+		for (const inst of info.loaded_instances ?? []) add(inst.id, info);
+	}
+	return map;
+}
+
+function enrichWithLmStudioCatalog(models: LlamaCppModel[], catalog: LmStudioModelInfo[]): LlamaCppModel[] {
+	const byKey = buildLmStudioCatalogMap(catalog);
+	return models.map((model) => {
+		const rawId = String(model.id ?? "");
+		const info = byKey.get(rawId.toLowerCase()) ?? byKey.get(baseName(rawId).toLowerCase());
+		if (!info) return model;
+		return { ...model, display_name: info.display_name ?? model.display_name, lmStudio: info };
+	});
+}
+
 /**
  * Detect the server kind for an endpoint:
  *   1. lucebox:    /props with server.name "luce-*"
  *   2. DwarfStar:  /props build_info "dwarf*"/"ds4*" (else via chat probe)
  *   3. ZINC:       /v1/models with owned_by === "zinc"
- *   4. llama.cpp:  anything else serving models
+ *   4. LM Studio:  OpenAI-compatible /v1/models + REST /api/v1|v0/models
+ *   5. llama.cpp:  anything else serving models
  */
 async function detectServerKind(
 	baseUrl: string,
 	models: LlamaCppModel[],
 	props: ServerProps | undefined,
+	lmStudioCatalog?: LmStudioModelInfo[],
 ): Promise<ServerKind | "unknown"> {
+	void baseUrl;
 	const serverName = String(props?.server?.name ?? props?.build_info ?? "").toLowerCase();
 	if (serverName.startsWith("luce")) return "lucebox";
 	if (serverName.startsWith("dwarf") || serverName.startsWith("ds4")) return "dwarfstar";
 	if (models.length > 0 && models[0].owned_by === "zinc") return "zinc";
+	if (models.some((m) => String(m.owned_by ?? "").toLowerCase().includes("lmstudio"))) return "lmstudio";
+	if (lmStudioCatalog && lmStudioCatalog.length > 0) return "lmstudio";
+	if (models.some((m) => m.lmStudio)) return "lmstudio";
 	if (models.length > 0) return "llamacpp";
 	return "unknown";
 }
@@ -767,13 +890,14 @@ function buildModelMetadata(
 ): ModelMetadata {
 	const meta: ModelMetadata = {};
 
-	// ── Model quant (GGUF filename / router id) ──
+	// ── Model quant (GGUF filename / router id / LM Studio metadata) ──
 	const sourcePath = entry.path ?? props?.model_path ?? rawId;
-	meta.quant = extractQuantTag(sourcePath);
+	meta.quant = extractQuantTag(sourcePath) ?? lmStudioQuantName(entry.lmStudio)?.toUpperCase();
 
 	// ── Vision ──
 	if (entry.architecture?.input_modalities?.includes("image")) meta.vision = true;
 	if (meta.vision === undefined && props?.modalities?.vision === true) meta.vision = true;
+	if (!meta.vision && (entry.lmStudio?.capabilities?.vision === true || entry.lmStudio?.type === "vlm")) meta.vision = true;
 	if (!meta.vision && local?.hasMmproj) meta.vision = true;
 
 	// ── Drafter (speculative decoding) ──
@@ -792,8 +916,9 @@ function buildModelMetadata(
 	meta.cacheK = argsInfo?.cacheK ?? local?.cacheK ?? props?.cache_type_k?.toLowerCase();
 	meta.cacheV = argsInfo?.cacheV ?? local?.cacheV ?? props?.cache_type_v?.toLowerCase();
 
-	// ── Router load status ──
+	// ── Router / LM Studio load status ──
 	if (entry.status?.value) meta.routerStatus = entry.status.value;
+	else if (entry.lmStudio?.state && entry.lmStudio.state !== "loaded") meta.routerStatus = entry.lmStudio.state;
 
 	return meta;
 }
@@ -828,7 +953,7 @@ async function fetchModelsFromEndpoint(
 			return ep;
 		}
 		const payload = JSON.parse(body) as LlamaCppModelsResponse;
-		const models = payload.data ?? [];
+		let models = payload.data ?? [];
 
 		// llama.cpp provides a parallel models[] array with friendly names
 		const nameMap = new Map<string, string>();
@@ -838,18 +963,24 @@ async function fetchModelsFromEndpoint(
 			}
 		}
 
-		// ── Mode detection ──
+		// ── Mode + server metadata detection ──
 		// Router/multi-model entries carry path/status/architecture; the router's
-		// own /props answers with role: "router".
-		const isRouterShape = models.some((m) => m.path !== undefined || m.status !== undefined);
+		// own /props answers with role: "router". LM Studio answers OpenAI's
+		// /v1/models and exposes richer local metadata under /api/v1/models
+		// (legacy: /api/v0/models), without llama.cpp's /props endpoint.
 		let props = await fetchServerProps(baseUrl, settings.discoveryTimeoutMs, srv.apiKey);
+		const lmStudioCatalog = props ? undefined : await fetchLmStudioCatalog(baseUrl, settings.discoveryTimeoutMs, srv.apiKey);
+		if (lmStudioCatalog) models = enrichWithLmStudioCatalog(models, lmStudioCatalog);
+		const isRouterShape = models.some((m) => m.path !== undefined || m.status !== undefined);
 		const routerProps = props?.role === "router";
-		const mode: ServerMode = isRouterShape || routerProps ? "router" : "single";
+		const mode: ServerMode = lmStudioCatalog
+			? models.length > 1 ? "router" : "single"
+			: isRouterShape || routerProps ? "router" : "single";
 		// In single-model mode props describes THE model; in router mode the root
 		// props is the router itself (useless for per-model metadata).
 		if (mode === "router") props = undefined;
 
-		const kind = await detectServerKind(baseUrl, models, props);
+		const kind = await detectServerKind(baseUrl, models, props, lmStudioCatalog);
 		// lucebox always enriches via /props (its own schema, even without router).
 		if (kind === "lucebox") {
 			props = (await fetchServerProps(baseUrl, settings.discoveryTimeoutMs, srv.apiKey)) ?? props;
@@ -892,6 +1023,10 @@ async function fetchModelsFromEndpoint(
 // =============================================================================
 
 /** Compat profile per server kind. */
+function supportsThinkingBudget(kind: ServerKind | "unknown" | "auto" | undefined): boolean {
+	return kind === "llamacpp" || kind === "lucebox";
+}
+
 function makeCompat(kind: ServerKind | "unknown" | "auto") {
 	const usageInStreaming = kind !== "zinc";
 	return {
@@ -901,8 +1036,9 @@ function makeCompat(kind: ServerKind | "unknown" | "auto") {
 		supportsUsageInStreaming: usageInStreaming,
 		supportsStrictMode: false,
 		// llama.cpp accepts a per-request `thinking_budget_tokens` cap.
+		// LM Studio is OpenAI-compatible but does not accept llama.cpp-only fields.
 		// (Only honored by pi when the model is registered with reasoning: true.)
-		...(kind === "llamacpp" || kind === "lucebox" ? { thinkingTokenBudgetField: THINKING_BUDGET_FIELD } : {}),
+		...(supportsThinkingBudget(kind) ? { thinkingTokenBudgetField: THINKING_BUDGET_FIELD } : {}),
 	};
 }
 
@@ -966,6 +1102,25 @@ function toPiModel(
 		routerStatus: modelMeta.routerStatus,
 		...(srv.apiKey ? { headers: { Authorization: `Bearer ${srv.apiKey}` } } : {}),
 	};
+
+	// ── LM Studio: OpenAI-compatible runtime with rich REST model metadata ──
+	if (kind === "lmstudio") {
+		const info = model.lmStudio;
+		const contextWindow = lmStudioContextLength(info) ?? model.context_window ?? model.context_length ?? 32768;
+		const displayName = info?.display_name ? cleanModelName(info.display_name) : cleanModelName(rawId);
+		const modelId = usePrefix ? prefixId(rawId) : rawId;
+		return {
+			...common,
+			id: modelId,
+			name: `${displayName}${badgeSuffix(modelMeta, settings.showBadgesInNames)}`,
+			// LM Studio exposes reasoning-capable models, but its OpenAI-compatible
+			// endpoint does not use llama.cpp's thinking_budget_tokens field.
+			reasoning: false,
+			contextWindow,
+			maxTokens: model.max_tokens ?? Math.min(contextWindow, 8192),
+			compat: makeCompat(kind),
+		};
+	}
 
 	// ── lucebox: alias as source of truth, rich metadata from /props ──
 	if (kind === "lucebox") {
@@ -1126,6 +1281,7 @@ function modelsSignature(endpoints: EndpointResult[]): string {
 		.map((r) => {
 			const models = r.models
 				.filter((m) => {
+					if (r.server === "lmstudio") return true;
 					const st = r.meta.get(String(m.id ?? ""))?.routerStatus;
 					return !st || st === "loaded" || rIncludeUnloaded;
 				})
@@ -1178,7 +1334,11 @@ function buildAndRegisterProvider(pi: ExtensionAPI, scan: ScanResult, config: In
 		if (!srv) continue;
 
 		// Router mode: skip unloaded models unless explicitly included.
+		// LM Studio's /v1/models can expose embedding models too; this provider
+		// registers chat/completions models only.
 		const visibleModels = ep.models.filter((m) => {
+			const lmType = m.lmStudio?.type;
+			if (ep.server === "lmstudio") return lmType !== "embedding" && lmType !== "embeddings";
 			const st = ep.meta.get(String(m.id ?? ""))?.routerStatus;
 			return !st || st === "loaded" || settings.includeUnloadedRouterModels;
 		});
@@ -1644,6 +1804,8 @@ export default function (pi: ExtensionAPI) {
 		const payload = event.payload as Record<string, unknown>;
 		const modelId = typeof payload.model === "string" ? payload.model : undefined;
 		if (!modelId) return undefined;
+		const baseUrl = modelBaseUrls.get(modelId);
+		if (!supportsThinkingBudget(endpointKinds.get(baseUrl ?? "") as ServerKind | undefined)) return undefined;
 		const budgets = config.modelOptions[modelId]?.thinkingBudgets;
 		if (!budgets) return undefined;
 		const level = normalizeLevel(ctx.thinkingLevel ?? currentThinkingLevel);
@@ -1681,7 +1843,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Command: /llamacpp-infra ───────────────────────────────────
 	pi.registerCommand("llamacpp-infra", {
-		description: "llama.cpp-infra: discover llama.cpp/ZINC/DwarfStar models on any machine (config, scan, metrics…)",
+		description: "llama.cpp-infra: discover llama.cpp/ZINC/DwarfStar/LM Studio models on any machine (config, scan, metrics…)",
 		getArgumentCompletions: (prefix) =>
 			["config", "scan", "status", "list", "metrics", "help"]
 				.filter((s) => s.startsWith(prefix))
@@ -1815,7 +1977,7 @@ export default function (pi: ExtensionAPI) {
 	function showHelp(ctx: ExtensionContext) {
 		ctx.ui.notify(
 			[
-				"🦙 llama.cpp-infra — models served by llama.cpp & variants (ZINC, DwarfStar/ds4, lucebox) on any machine",
+				"🦙 llama.cpp-infra — models served by llama.cpp & variants (ZINC, DwarfStar/ds4, lucebox, LM Studio) on any machine",
 				"",
 				"  /llamacpp-infra            → quick status",
 				"  /llamacpp-infra config     → ⚙️ configure servers, budgets & settings",
@@ -1876,12 +2038,14 @@ export default function (pi: ExtensionAPI) {
 							"🦙 llama.cpp-infra",
 							"",
 							"Discovers models served by llama.cpp (single & router/multi-model),",
-							"ZINC, DwarfStar (ds4-server) and lucebox on any number of machines,",
-							"and registers them into pi's native /model list.",
+							"ZINC, DwarfStar (ds4-server), lucebox and LM Studio on any number",
+							"of machines, and registers them into pi's native /model list.",
 							"",
+							"LM Studio uses its OpenAI-compatible /v1 endpoint and enriches",
+							"metadata from /api/v1/models (or legacy /api/v0/models).",
 							"Per-model metadata: vision, drafter, model quant, KV cache quant.",
 							"Per-model thinking budgets via llama.cpp thinking_budget_tokens.",
-							"Live throughput metrics from each server's /metrics endpoint.",
+							"Live throughput metrics from each server's /metrics endpoint when exposed.",
 							"",
 							`Config: ${getConfigPath()}`,
 						].join("\n"),
@@ -2079,7 +2243,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`⚠️ A server with host "${trimmedHost}" already exists`, "warning");
 			return;
 		}
-		const portsRaw = await ctx.ui.input("➕ Ports to probe", "e.g. 8000, 8080-8082");
+		const portsRaw = await ctx.ui.input("➕ Ports to probe", "e.g. 1234, 8000, 8080-8082");
 		if (portsRaw === undefined) return;
 		const ports = parsePorts(portsRaw);
 		if (!ports) {
@@ -2088,7 +2252,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		const label = await ctx.ui.input("🏷️ Label (optional)", trimmedHost);
 		if (label === undefined) return;
-		const probeDs4 = await ctx.ui.confirm("🕵️ ds4 (DwarfStar) probe?", "Enable the chat-completions ping probe for this machine? (for DwarfStar/ds4-server hosts)");
+		const probeDs4 = await ctx.ui.confirm("🕵️ ds4 (DwarfStar) probe?", "Enable the chat-completions ping probe for this machine? (for DwarfStar/ds4-server hosts; not needed for LM Studio)");
 
 		let id = idSafeHost(trimmedHost).replace(/[^a-z0-9.-]/g, "-");
 		let n = 2;
