@@ -1,7 +1,7 @@
 {
   "name": "pi-llamacpp-infra",
   "version": "1.0.1",
-  "description": "Discovery, metrics and control of llama.cpp-family servers for pi: probes any number of machines (localhost, LAN, Tailscale), registers every model into pi's native /model list, and provides live Prometheus metrics, per-model thinking budgets, vision detection and a native config UI. Supports llama.cpp, ZINC, DwarfStar/ds4, lucebox and LM Studio.",
+  "description": "Discovery, metrics and control of llama.cpp-family servers for pi (llama.cpp, ZINC, DwarfStar/ds4, lucebox, LM Studio): scan machines (localhost, LAN, Tailscale), register models, live metrics, per-model thinking budgets, vision detection, native config UI.",
   "keywords": [
     "pi-package",
     "llamacpp",

@@ -35,7 +35,7 @@ Anything else (vLLM, Ollama, cloud APIs…) is out of scope — use pi's built-i
 
 ## Install
 
-llamacpp-infra is a [pi package](https://pi.dev/packages): one extension (`src/index.ts`) plus an inlined warmup module, declared in `package.json`.
+llamacpp-infra is a [pi package](https://pi.dev/packages): a small entrypoint (`src/index.ts`) backed by several focused modules. Heavier pieces (UI, scan engine, metrics, header warmup) are loaded lazily on first use so the extension stays light at startup. The package is declared in `package.json`.
 
 ```bash
 # From GitHub
@@ -257,15 +257,33 @@ It polls the server's Prometheus `/metrics` endpoint (or JSON `/stats`) and show
 
 ```
 llamacpp-infra/
-├── package.json        # pi package manifest (pi-package)
-├── LICENSE             # MIT
+├── package.json         # pi package manifest (pi-package)
+├── LICENSE              # MIT
 ├── README.md
 └── src/
-    ├── index.ts        # Extension entry point (~2600 lines)
-    └── prompt-warmup.ts # Header warmup module (inlined, ~600 lines)
+    ├── index.ts         # Entrypoint: hooks, command, lifecycle. Statically imports core + types.
+    ├── core.ts          # Config persistence, shared state, id helpers, compat profile (loaded at startup).
+    ├── types.ts         # Shared interfaces (type-only; erased at runtime).
+    ├── scan.ts          # Discovery engine (lazy: HTTP probing, /props, LM Studio catalog, /proc, kind detection).
+    ├── registration.ts  # Scan → pi-model mapping + provider registration (lazy).
+    ├── metrics.ts       # Prometheus/JSON metrics engine + widget (lazy; only if `metricsEnabled`).
+    ├── ui.ts            # /llamacpp-infra subcommands, menus, status, help (lazy).
+    └── prompt-warmup.ts # Header warmup: capture + cache system prompt KV (lazy; only if `warmup`).
 ```
 
-Two-file extension with zero external dependencies (only pi's bundled `@earendil-works/pi-coding-agent` + Node built-ins):
+Module load profile:
+
+| Module | Loaded when | Approx. size |
+|---|---|---|
+| `index.ts` + `core.ts` (+ `types.ts`) | Startup (static) | ~25 KB |
+| `scan.ts` + `registration.ts` | First discovery (dynamic) | ~27 KB |
+| `prompt-warmup.ts` | Primed at load if `warmup` enabled; not loaded when disabled | ~15 KB; skipped entirely when `warmup` is OFF |
+| `metrics.ts` | Primed at load if `metricsEnabled`; not loaded when disabled | ~9 KB; skipped entirely when `metricsEnabled` is OFF |
+| `ui.ts` | First `/llamacpp-infra …` command (dynamic) | ~32 KB |
+
+Zero external npm dependencies (only pi's bundled `@earendil-works/pi-coding-agent` + Node built-ins).
+
+Subsystems:
 
 - **Discovery engine** — multi-server probing with timeouts, retry budgets, and per-server kind detection (llama.cpp, ZINC, DwarfStar, lucebox, LM Studio)
 - **Router support** — single-model and multi-model llama.cpp modes with per-model status, args parsing and metadata extraction
