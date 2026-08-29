@@ -12,3 +12,8 @@ Thumbs.db
 
 # Local pi project config
 .pi/
+
+# Agent-only artifacts (plan files, project memory) — never commit
+plan_*.md
+pi.md
+pi.md.local
