@@ -2,6 +2,16 @@
 
 ![llamacpp-infra banner](docs/banner.png)
 
+<pre>
+    .                                         o8o      .             
+  .o8                                         `"'    .o8             
+.o888oo  .ooooo.  oooo d8b ooo. .oo.  .oo.   oooo  .o888oo  .ooooo.  
+  888   d88' `88b `888""8P `888P"Y88bP"Y88b  `888    888   d88' `88b 
+  888   888ooo888  888      888   888   888   888    888   888ooo888 
+  888 . 888    .o  888      888   888   888   888    888 . 888    .o 
+  "888" `Y8bod8P' d888b    o888o o888o o888o o888o   "888" `Y8bod8P'
+</pre>
+
 </div>
 
 # llamacpp-infra — Discovery, Metrics & Control for llama.cpp-family Servers

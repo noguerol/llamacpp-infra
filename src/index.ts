@@ -1485,6 +1485,22 @@ export default function (pi: ExtensionAPI) {
 	const consecutiveFails = new Map<string, number>();
 	let anyEverOk = false;
 	const startedAt = Date.now();
+	/**
+	 * Extension contexts become invalid as soon as pi replaces/reloads a
+	 * session. Async discovery and metric timers may outlive that boundary, so
+	 * they must never touch captured ctx/pi objects after shutdown.
+	 */
+	let extensionActive = true;
+
+	function ctxHasUI(ctx?: ExtensionContext): ctx is ExtensionContext {
+		if (!ctx || !extensionActive) return false;
+		try {
+			return ctx.hasUI;
+		} catch (err) {
+			debugLog(`stale ctx ignored: ${err instanceof Error ? err.message : String(err)}`);
+			return false;
+		}
+	}
 
 	const epKey = (host: string, port: number) => `${host}:${port}`;
 
@@ -1539,7 +1555,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function renderMetricsWidget(lines: string[] | undefined, ctx: ExtensionContext) {
-		if (!ctx.hasUI) return;
+		if (!ctxHasUI(ctx)) return;
 		if (lines === undefined) {
 			if (metricsWidgetVisible) {
 				ctx.ui.setWidget(METRICS_WIDGET_ID, undefined);
@@ -1592,6 +1608,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function pollMetrics(ctx: ExtensionContext): Promise<void> {
+		if (!extensionActive) return;
 		try {
 			const model = ctx.model;
 			// Only our models have metrics; anything else hides the widget.
@@ -1646,20 +1663,23 @@ export default function (pi: ExtensionAPI) {
 			const deltaSec = prev ? (now - prev.ts) / 1000 : 0;
 			metricsPrev.set(key, { raw, ts: now });
 
-			const fg = ctx.hasUI ? ((ctx.ui.theme?.fg)?.bind(ctx.ui.theme) ?? safeFg) : safeFg;
+			const fg = ctxHasUI(ctx) ? ((ctx.ui.theme?.fg)?.bind(ctx.ui.theme) ?? safeFg) : safeFg;
 			renderMetricsWidget(buildMetricsLine(raw, deltaSec, prev, fg), ctx);
 		} catch (err) {
+			if (!extensionActive) return;
 			const msg = err instanceof Error ? err.message : String(err);
 			debugLog(`metrics poll failed: ${msg}`);
-			const fg = ctx.hasUI ? ((ctx.ui.theme?.fg)?.bind(ctx.ui.theme) ?? safeFg) : safeFg;
+			const fg = ctxHasUI(ctx) ? ((ctx.ui.theme?.fg)?.bind(ctx.ui.theme) ?? safeFg) : safeFg;
 			renderMetricsWidget([fg("muted", "📊 ⏸ idle")], ctx);
 		}
 	}
 
 	function startMetricsPolling(ctx: ExtensionContext): void {
-		if (metricsTimer) return;
+		if (!extensionActive || metricsTimer) return;
 		void pollMetrics(ctx);
-		metricsTimer = setInterval(() => void pollMetrics(ctx), config.settings.metricsPollMs);
+		metricsTimer = setInterval(() => {
+			if (extensionActive) void pollMetrics(ctx);
+		}, config.settings.metricsPollMs);
 		metricsTimer?.unref?.();
 	}
 
@@ -1705,7 +1725,9 @@ export default function (pi: ExtensionAPI) {
 	/** One discovery pass: scan, register, update known-good tracking. */
 	async function discoverAndRegister(): Promise<{ scan: ScanResult; shouldPoll: boolean }> {
 		try {
+			if (!extensionActive) return { scan: { endpoints: [], totalModels: 0, serversUp: 0, serversTotal: 0 }, shouldPoll: false };
 			const scan = await scanAllServers(config);
+			if (!extensionActive) return { scan, shouldPoll: false };
 			lastScan = scan;
 
 			// Skip redundant re-registers while polling: only rebuild when the
@@ -1741,22 +1763,30 @@ export default function (pi: ExtensionAPI) {
 			}
 			return { scan, shouldPoll: shouldContinuePolling(scan.endpoints, scan.endpoints.some((e) => e.loading)) };
 		} catch (err) {
-			lastError = err instanceof Error ? err.message : String(err);
+			if (extensionActive) lastError = err instanceof Error ? err.message : String(err);
 			return { scan: { endpoints: [], totalModels: 0, serversUp: 0, serversTotal: 0 }, shouldPoll: false };
 		}
 	}
 
 	/** Clock-bounded background polling while servers load / restart. */
 	function schedulePolling(shouldPoll: boolean) {
-		if (!shouldPoll || polling) return;
+		if (!extensionActive || !shouldPoll || polling) return;
 		polling = true;
 		const deadline = Date.now() + config.settings.pollMaxMs;
 		const tick = async () => {
+			if (!extensionActive) {
+				polling = false;
+				return;
+			}
 			if (Date.now() >= deadline) {
 				polling = false;
 				return;
 			}
 			const r = await discoverAndRegister();
+			if (!extensionActive) {
+				polling = false;
+				return;
+			}
 			if (r.shouldPoll) {
 				pollTimer = setTimeout(tick, config.settings.pollIntervalMs);
 				pollTimer?.unref?.();
@@ -1776,16 +1806,18 @@ export default function (pi: ExtensionAPI) {
 
 	/** Full rescan: reset polling, clear provider, discover, update footer. */
 	async function rescan(ctx?: ExtensionContext) {
-		ctx?.ui.setStatus(STATUS_KEY, "🔎 scanning…");
+		if (!extensionActive) return;
+		if (ctxHasUI(ctx)) ctx.ui.setStatus(STATUS_KEY, "🔎 scanning…");
 		stopPolling();
 		registerEmptyProvider();
 		const r = await discoverAndRegister();
+		if (!extensionActive) return;
 		schedulePolling(r.shouldPoll);
 		updateStatusFooter(ctx);
 	}
 
 	function updateStatusFooter(ctx?: ExtensionContext) {
-		if (!ctx?.hasUI) return;
+		if (!ctxHasUI(ctx)) return;
 		if (registeredCount > 0) {
 			const up = lastScan?.serversUp ?? 0;
 			const total = lastScan?.serversTotal ?? 0;
@@ -1801,7 +1833,13 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Initial non-blocking registration ──────────────────────────
 	registerEmptyProvider();
-	void discoverAndRegister().then((r) => schedulePolling(r.shouldPoll));
+	void discoverAndRegister()
+		.then((r) => {
+			if (extensionActive) schedulePolling(r.shouldPoll);
+		})
+		.catch((err) => {
+			if (extensionActive) debugLog(`initial discovery failed: ${err instanceof Error ? err.message : String(err)}`);
+		});
 
 	// ── Hook 0: compact registered id → raw server model id ─────────
 	// Model ids registered in pi are compact display ids ("Name (host:port)");
@@ -2629,20 +2667,27 @@ export default function (pi: ExtensionAPI) {
 	// ── Events ─────────────────────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
-		if (ctx.hasUI) warmupStatus.bind(ctx.ui);
+		if (ctxHasUI(ctx)) warmupStatus.bind(ctx.ui);
 		if (config.settings.warmup) warmer.warmupForModel(ctx.model, safeSystemPrompt(ctx), ctx.cwd);
 		currentThinkingLevel = ctx.thinkingLevel;
 		// Metrics poller starts unconditionally: each tick re-checks the active
 		// model and stays idle (no HTTP) while it is not ours. This covers the
 		// race where session_start fires before discovery has registered models.
 		if (config.settings.metricsEnabled) startMetricsPolling(ctx);
-		if (!ctx.hasUI) return;
+		if (!ctxHasUI(ctx)) return;
 		// Re-scan in the background: models that finished loading appear on
 		// their own, without needing /llamacpp-infra scan.
-		void discoverAndRegister().then((r) => {
-			schedulePolling(r.shouldPoll);
-			updateStatusFooter(ctx);
-		});
+		void discoverAndRegister()
+			.then((r) => {
+				if (!extensionActive) return;
+				schedulePolling(r.shouldPoll);
+				updateStatusFooter(ctx);
+			})
+			.catch((err) => {
+				if (!extensionActive) return;
+				lastError = err instanceof Error ? err.message : String(err);
+				updateStatusFooter(ctx);
+			});
 	});
 
 	pi.on("model_select", (event, ctx) => {
@@ -2650,7 +2695,7 @@ export default function (pi: ExtensionAPI) {
 			stopMetricsPolling(ctx);
 			return;
 		}
-		if (ctx.hasUI) warmupStatus.bind(ctx.ui);
+		if (ctxHasUI(ctx)) warmupStatus.bind(ctx.ui);
 		if (config.settings.warmup) warmer.warmupForModel(event.model, safeSystemPrompt(ctx), ctx.cwd);
 		// New endpoint → reset metrics state and (re)start polling.
 		metricsCurrentKey = undefined;
@@ -2664,6 +2709,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
+		extensionActive = false;
 		stopPolling();
 		stopMetricsPolling();
 		warmer.dispose();
