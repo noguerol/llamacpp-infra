@@ -29,7 +29,7 @@
     "extensions": [
       "./src/index.ts"
     ],
-    "image": "https://raw.githubusercontent.com/noguerol/llamacpp-infra/main/docs/preview.png"
+    "image": "https://raw.githubusercontent.com/noguerol/llamacpp-infra/main/docs/preview.jpeg"
   },
   "files": [
     "src"

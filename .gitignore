@@ -17,3 +17,7 @@ Thumbs.db
 plan_*.md
 pi.md
 pi.md.local
+
+# punched-memory — never commit project-local memory
+.punched-memory.json
+.punched-memory/

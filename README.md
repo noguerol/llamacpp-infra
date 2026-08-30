@@ -1,6 +1,6 @@
 # llamacpp-infra — Discovery, Metrics & Control for llama.cpp-family Servers
 
-![llamacpp-infra banner](docs/banner.png)
+![llamacpp-infra banner](docs/banner.jpeg)
 
 **llamacpp-infra** turns pi into a first-class citizen of local llama.cpp infrastructure. It probes any number of machines — localhost, LAN or Tailscale — discovers every model served by llama.cpp and its variants (including LM Studio), registers them into pi's native `/model` list, and gives you live Prometheus metrics, per-model thinking budgets, vision detection and a full configuration UI — all without leaving the pi prompt.
 
