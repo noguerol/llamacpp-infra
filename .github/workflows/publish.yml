@@ -13,10 +13,10 @@ jobs:
       id-token: write # OIDC for npm Trusted Publishing (no tokens needed)
     steps:
       - uses: actions/checkout@v4
+      # Node 24 ships npm 11.x, which implements npm OIDC Trusted Publishing
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
+          node-version: 24
       - name: Read package name & version
         id: pkg
         run: |
@@ -32,4 +32,4 @@ jobs:
           fi
       - name: Publish to npm (Trusted Publishing / OIDC)
         if: steps.check.outputs.exists == 'false'
-        run: npm publish
+        run: npm publish --provenance --access public
