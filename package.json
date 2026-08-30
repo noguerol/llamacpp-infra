@@ -1,6 +1,6 @@
 {
   "name": "pi-llamacpp-infra",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Discovery, metrics and control of llama.cpp-family servers for pi (llama.cpp, ZINC, DwarfStar/ds4, lucebox, LM Studio): scan machines (localhost, LAN, Tailscale), register models, live metrics, per-model thinking budgets, vision detection, native config UI.",
   "keywords": [
     "pi-package",
