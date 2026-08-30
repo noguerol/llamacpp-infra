@@ -191,7 +191,9 @@ export function showHelp(ctx: ExtensionContext): void {
 			"  /llamacpp-infra scan       → rescan",
 			"  /llamacpp-infra status     → per-endpoint report",
 			"  /llamacpp-infra list       → models with quant/vision/drafter",
-			"  /llamacpp-infra metrics    → toggle metrics widget",
+			"  /llamacpp-infra metrics    → toggle live speed & metrics in the footer",
+			"  (footer: ⚡ prefill + 🔥 generation speed of the active model, shown in",
+			"   the status line; when pi is idle it also mirrors other clients from /metrics)",
 			"",
 			`Config: ${getConfigPath()}`,
 		].join("\n"),
@@ -212,8 +214,8 @@ export async function showConfigMenu(ctx: ExtensionContext, deps: UiDeps): Promi
 			{ value: "budgets", label: "🧠 Thinking budgets", description: `${budgetCount} model(s) with budgets` },
 			{
 				value: "metrics",
-				label: `📈 Live metrics: ${config.settings.metricsEnabled ? "ON" : "OFF"}`,
-				description: `poll ${formatMs(config.settings.metricsPollMs)}`,
+				label: `📈 Live speed & metrics: ${config.settings.metricsEnabled ? "ON" : "OFF"}`,
+				description: `per-token speed · server poll ${formatMs(config.settings.metricsPollMs)}`,
 			},
 			{ value: "settings", label: "⚙️ Discovery settings", description: "timeouts, polling, vision, badges…" },
 			{ value: "about", label: "ℹ️ About", description: "how this extension works" },
@@ -576,16 +578,16 @@ async function editModelBudgets(ctx: ExtensionContext, modelId: string): Promise
 async function showMetricsMenu(ctx: ExtensionContext, deps: UiDeps): Promise<void> {
 	const config = shared.activeConfig!;
 	for (;;) {
-		const action = await selectFrom(ctx, "📈 Live metrics", [
+		const action = await selectFrom(ctx, "📈 Live speed & metrics", [
 			{
 				value: "toggle",
-				label: config.settings.metricsEnabled ? "🔴 Disable metrics widget" : "🟢 Enable metrics widget",
-				description: "auto-shows for llamacpp-infra models",
+				label: config.settings.metricsEnabled ? "🔴 Disable footer speed metrics" : "🟢 Enable footer speed metrics",
+				description: "⚡ prefill + 🔥 generation speed per token; server /metrics supplement",
 			},
 			{
 				value: "interval",
-				label: `🔁 Poll interval: ${formatMs(config.settings.metricsPollMs)}`,
-				description: "how often /metrics is fetched",
+				label: `🔁 Server poll: ${formatMs(config.settings.metricsPollMs)}`,
+				description: "how often the /metrics endpoint is fetched (supplement only)",
 			},
 			{ value: "__back", label: "← Back", description: "" },
 		]);

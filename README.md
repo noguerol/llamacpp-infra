@@ -26,7 +26,7 @@ Anything else (vLLM, Ollama, cloud APIs…) is out of scope — use pi's built-i
 - **Compact model ids** — models appear as `Name (host:port)` in pi's `/model` picker, like a native provider; the raw GGUF path/alias is sent to the server automatically on every request
 - **Single-model & router modes** — llama.cpp single-model mode (one GGUF per instance) and router mode (multiple models per server, with per-model status and args)
 - **Per-model metadata badges** — 👁️ vision (mmproj / modalities), 🚀 drafter (speculative decoding), 🗜️ quant tag from GGUF filename, 🧠 KV cache quantization (from server args or `/proc`)
-- **Live Prometheus metrics** — polls `/metrics` (or `/stats`) and renders a compact widget with instantaneous prompt/gen throughput; auto-activates for llamacpp-infra models only
+- **Live speed & metrics** — a constantly updating footer reading of the active model's prefill (⚡) and generation (🔥) token speed, measured straight from the stream (per token, ~10 updates/s); when pi is idle it also mirrors other clients the server's `/metrics` endpoint reports. Lives in the footer's status line, so no extra terminal row is taken. Works even without `--metrics`
 - **Thinking budgets** — llama.cpp accepts `thinking_budget_tokens` per request; configure budgets per thinking level (minimal/low/medium/high/xhigh/max) per model; models with budgets are registered with reasoning enabled
 - **Header warmup** — pre-caches the system prompt KV on llama.cpp-family servers so the first real request is faster
 - **LM Studio support** — uses LM Studio's OpenAI-compatible `/v1` API, enriches names/context/quant/vision from `/api/v1/models` (or legacy `/api/v0/models`), and avoids llama.cpp-only request fields
@@ -99,7 +99,7 @@ No special payload workaround is required: LM Studio accepts standard OpenAI cha
 | `/llamacpp-infra scan` | Rescan all servers now |
 | `/llamacpp-infra status` | Detailed per-endpoint report |
 | `/llamacpp-infra list` | List discovered models with metadata badges |
-| `/llamacpp-infra metrics` | Toggle the live metrics widget |
+| `/llamacpp-infra metrics` | Toggle live speed & metrics in the footer |
 | `/llamacpp-infra help` | Command help |
 
 ### `/llamacpp-infra config`
@@ -111,7 +111,7 @@ The main config menu branches into submenus:
 - **📋 Models** — per-model options (thinking budgets, replace/remove)
 - **🧪 Test** — connectivity test of all configured servers
 - **🧠 Thinking budgets** — configure per-model thinking_budget_tokens per level
-- **📈 Metrics** — enable/disable widget, poll interval
+- **📈 Metrics** — enable/disable footer metrics, server poll interval
 - **⚙️ Settings** — discovery timeout, poll interval/budget, startup grace, fail limit, vision detection, prefix model IDs, name badges, unloaded router models, header warmup
 - **ℹ️ About** — extension info
 
@@ -224,7 +224,7 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 | `showBadgesInNames` | `true` | Append 👁️🚀💤 badges to model display names |
 | `includeUnloadedRouterModels` | `false` | Router mode: list models that are not currently loaded |
 | `warmup` | `true` | Pre-cache system prompt KV on llama.cpp servers |
-| `metricsEnabled` | `true` | Auto-show live metrics widget for llamacpp-infra models |
+| `metricsEnabled` | `true` | Show live speed & metrics in the footer for llamacpp-infra models |
 | `metricsPollMs` | `5000` | How often `/metrics` is fetched |
 
 ### Thinking budgets
@@ -245,15 +245,22 @@ With `prefixModelIds: false` the machine tag is omitted (`ModelName`); it is re-
 
 llama.cpp-family models are registered as reasoning models, exactly like a native pi provider: the footer shows `ModelName (host:port) • <level>`, the thinking selector offers levels with token estimates, and pi sends the configured `thinking_budget_tokens` budget on each request. Per-model budgets configured in the extension override pi's global per-level budgets.
 
-## Live Metrics Widget
+## Live Speed & Metrics (footer)
 
-When enabled, the metrics widget appears automatically when the active model is from llamacpp-infra:
+When enabled, the speed reading appears in the footer's status line (no extra terminal row) whenever the active model is from llamacpp-infra, updating constantly while tokens flow:
 
 ```
-📊 local:8080  ⚡ 42.3 t/s prompt · 38.1 t/s gen · 1.2k tokens
+🦙 12 models · 3/3 ✓ 📊 · ⚡ prefill…                    (before the first token)
+🦙 12 models · 3/3 ✓ 📊 · 🔥 38.1 t/s · ⚡ 420 · 1.2k tok  (while streaming)
+🦙 12 models · 3/3 ✓ 📊 · 🔥 38.1 t/s · ⚡ 420 · 1.2k tok  (just after the answer ends)
+🦙 12 models · 3/3 ✓ 📊 · ⏸ idle                         (between turns)
+🦙 12 models · 3/3 ✓ 📊 · ▶ 2 · ⚡ 150 · 🔥 18.0 · server (pi idle, server busy for other clients)
 ```
 
-It polls the server's Prometheus `/metrics` endpoint (or JSON `/stats`) and shows instantaneous throughput. The poll interval is configurable (default 5s).
+(The `🦙 …` prefix is the extension's model-count status; both live on the same footer line, so no extra row is consumed.)
+
+- **Client measurement (always, no `--metrics` needed)** — prefill speed = `prompt tokens ÷ (request → first token)` (pi's `usage.input`, OpenAI-style `prompt_tokens` as fallback); generation speed = a moving 1.5 s window over per-token arrival samples. Updated ~every 100 ms while a stream is live (throttled, and unchanged text is skipped, so the footer never churns).
+- **Server supplement (only when pi is idle)** — the poller fetches the server's Prometheus `/metrics` endpoint (or JSON `/stats`) every `metricsPollMs` (default 5 s). If the server reports other clients processing, their ⚡/🔥 rates are shown; when the server is idle, the plain `⏸ idle` reading returns.
 
 ## Architecture
 
@@ -268,7 +275,8 @@ llamacpp-infra/
     ├── types.ts         # Shared interfaces (type-only; erased at runtime).
     ├── scan.ts          # Discovery engine (lazy: HTTP probing, /props, LM Studio catalog, /proc, kind detection).
     ├── registration.ts  # Scan → pi-model mapping + provider registration (lazy).
-    ├── metrics.ts       # Prometheus/JSON metrics engine + widget (lazy; only if `metricsEnabled`).
+    ├── metrics.ts       # Server /metrics poller → ServerMetricsState (lazy; only if `metricsEnabled`).
+    ├── speed.ts         # Client-side speed tracker + footer status line (lazy; only if `metricsEnabled`).
     ├── ui.ts            # /llamacpp-infra subcommands, menus, status, help (lazy).
     └── prompt-warmup.ts # Header warmup: capture + cache system prompt KV (lazy; only if `warmup`).
 ```
@@ -280,7 +288,7 @@ Module load profile:
 | `index.ts` + `core.ts` (+ `types.ts`) | Startup (static) | ~25 KB |
 | `scan.ts` + `registration.ts` | First discovery (dynamic) | ~27 KB |
 | `prompt-warmup.ts` | Primed at load if `warmup` enabled; not loaded when disabled | ~15 KB; skipped entirely when `warmup` is OFF |
-| `metrics.ts` | Primed at load if `metricsEnabled`; not loaded when disabled | ~9 KB; skipped entirely when `metricsEnabled` is OFF |
+| `metrics.ts` + `speed.ts` | Primed at load if `metricsEnabled`; not loaded when disabled | ~18 KB; skipped entirely when `metricsEnabled` is OFF |
 | `ui.ts` | First `/llamacpp-infra …` command (dynamic) | ~32 KB |
 
 Zero external npm dependencies (only pi's bundled `@earendil-works/pi-coding-agent` + Node built-ins).
@@ -289,7 +297,7 @@ Subsystems:
 
 - **Discovery engine** — multi-server probing with timeouts, retry budgets, and per-server kind detection (llama.cpp, ZINC, DwarfStar, lucebox, LM Studio)
 - **Router support** — single-model and multi-model llama.cpp modes with per-model status, args parsing and metadata extraction
-- **Metrics subsystem** — Prometheus endpoint discovery, polling, and compact widget rendering
+- **Speed & metrics subsystem** — client-side per-token speed measurement (prefill + moving-window generation), throttled footer status updates, and server `/metrics` polling that supplements the footer while the client is idle
 - **Thinking budgets** — per-model per-level configuration with automatic `reasoning` registration
 - **Config persistence** — `~/.pi/agent/llamacpp-infra.json` with one-time migration from `local-models.json`
 - **/proc scanner** — local llama-server process detection for vision, KV cache quant, and drafter flags

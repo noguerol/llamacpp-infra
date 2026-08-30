@@ -18,7 +18,7 @@ export const PROVIDER_NAME = "llamacpp-infra";
 export const STATUS_KEY = "llamacpp-infra";
 export const CONFIG_FILE = "llamacpp-infra.json";
 export const LEGACY_CONFIG_FILE = "local-models.json";
-export const METRICS_WIDGET_ID = "llamacpp-infra-metrics";
+export const METRICS_STATUS_KEY = "llamacpp-infra-speed";
 export const DEFAULT_API_KEY = "no-auth";
 export const THINKING_BUDGET_FIELD = "thinking_budget_tokens";
 

@@ -33,11 +33,13 @@ export default function (pi: ExtensionAPI) {
 	type WarmerModule = typeof import("./prompt-warmup.ts");
 	type UiModule = typeof import("./ui.ts");
 	type MetricsModule = typeof import("./metrics.ts");
+	type SpeedModule = typeof import("./speed.ts");
 	type ScanModule = typeof import("./scan.ts");
 	type RegModule = typeof import("./registration.ts");
 
 	let warmerModPromise: Promise<WarmerModule> | undefined;
 	let metricsModPromise: Promise<MetricsModule> | undefined;
+	let speedModPromise: Promise<SpeedModule> | undefined;
 	let uiModPromise: Promise<UiModule> | undefined;
 	let scanModPromise: Promise<ScanModule> | undefined;
 	let regModPromise: Promise<RegModule> | undefined;
@@ -45,6 +47,7 @@ export default function (pi: ExtensionAPI) {
 	const loadWarmer = (): Promise<WarmerModule> => (warmerModPromise ??= import("./prompt-warmup.ts"));
 	const loadUi = (): Promise<UiModule> => (uiModPromise ??= import("./ui.ts"));
 	const loadMetrics = (): Promise<MetricsModule> => (metricsModPromise ??= import("./metrics.ts"));
+	const loadSpeed = (): Promise<SpeedModule> => (speedModPromise ??= import("./speed.ts"));
 	const loadScan = (): Promise<ScanModule> => (scanModPromise ??= import("./scan.ts"));
 	const loadReg = (): Promise<RegModule> => (regModPromise ??= import("./registration.ts"));
 
@@ -53,7 +56,10 @@ export default function (pi: ExtensionAPI) {
 	// factory returns, so these resolves race the first discoverAndRegister().
 	void loadScan();
 	void loadReg();
-	if (config.settings.metricsEnabled) void loadMetrics();
+	if (config.settings.metricsEnabled) {
+		void loadMetrics();
+		void loadSpeed();
+	}
 	if (config.settings.warmup) void loadWarmer();
 	void loadUi(); // command handler awaits this; priming keeps menus snappy
 
@@ -64,8 +70,9 @@ export default function (pi: ExtensionAPI) {
 	}
 	let warm: WarmerHandles | undefined;
 
-	// ── Metrics engine handle ─────────────────────────────────────────────
+	// ── Metrics engine + speed tracker handles ────────────────────────────
 	let metricsApi: ReturnType<MetricsModule["createMetrics"]> | undefined;
+	let speedApi: ReturnType<SpeedModule["createSpeedTracker"]> | undefined;
 
 	// ── Internal state ────────────────────────────────────────────────────
 	let lastSignature: string | undefined;
@@ -246,20 +253,14 @@ export default function (pi: ExtensionAPI) {
 		config.settings.metricsEnabled = !config.settings.metricsEnabled;
 		saveConfig(config);
 		if (config.settings.metricsEnabled) {
-			const m = await loadMetrics();
-			if (!metricsApi) {
-				metricsApi = m.createMetrics({
-					isActive: () => extensionActive,
-					hasUI: ctxHasUI,
-					pollIntervalMs: () => config.settings.metricsPollMs,
-					enabled: () => config.settings.metricsEnabled,
-				});
-			}
-			metricsApi.start(ctx);
-			ctx.ui.notify("📊 Metrics widget enabled", "info");
+			await ensureSpeed().then((s) => s?.start(ctx));
+			const m = await ensureMetrics();
+			m.start(ctx);
+			ctx.ui.notify("📊 Live speed & metrics enabled (footer)", "info");
 		} else {
+			speedApi?.stop(ctx);
 			metricsApi?.stop(ctx);
-			ctx.ui.notify("📊 Metrics widget disabled", "info");
+			ctx.ui.notify("📊 Live speed & metrics disabled", "info");
 		}
 	}
 
@@ -268,6 +269,25 @@ export default function (pi: ExtensionAPI) {
 		metricsApi.stop(ctx);
 		if (config.settings.metricsEnabled) metricsApi.start(ctx);
 	}
+
+	// ── Live speed: per-call prefill timing (before id rewrite) ──────────
+	pi.on("before_provider_request", (_event, ctx) => {
+		speedApi?.onRequest(ctx, Date.now());
+		return undefined;
+	});
+
+	// ── Live speed: stream events (token arrivals, message/turn ends) ────
+	pi.on("message_update", (event, ctx) => {
+		speedApi?.onToken(ctx, event.assistantMessageEvent, Date.now());
+	});
+
+	pi.on("message_end", (event, ctx) => {
+		speedApi?.onMessageEnd(ctx, event.message, Date.now());
+	});
+
+	pi.on("turn_end", (_event, ctx) => {
+		speedApi?.onTurnEnd(ctx);
+	});
 
 	// ── Hook 0: compact id → raw server model id ──────────────────────────
 	pi.on("before_provider_request", (event, _ctx) => {
@@ -374,14 +394,37 @@ export default function (pi: ExtensionAPI) {
 		return warm;
 	}
 
+	async function ensureSpeed(): Promise<NonNullable<typeof speedApi> | undefined> {
+		if (!speedApi) {
+			const m = await loadSpeed();
+			if (!speedApi) {
+				speedApi = m.createSpeedTracker({
+					isActive: () => extensionActive,
+					hasUI: ctxHasUI,
+					isOurs: (ctx) => {
+						try {
+							return ctx?.model?.provider === PROVIDER_NAME;
+						} catch {
+							return false; // post-shutdown ctx (live `model` getter throws)
+						}
+					},
+					enabled: () => config.settings.metricsEnabled,
+				});
+			}
+		}
+		return speedApi;
+	}
+
 	async function ensureMetrics(): Promise<NonNullable<typeof metricsApi>> {
 		if (!metricsApi) {
 			const m = await loadMetrics();
 			metricsApi = m.createMetrics({
 				isActive: () => extensionActive,
-				hasUI: ctxHasUI,
 				pollIntervalMs: () => config.settings.metricsPollMs,
 				enabled: () => config.settings.metricsEnabled,
+				onServerState: (ctx, st) => {
+					speedApi?.onServerState(ctx, st);
+				},
 			});
 		}
 		return metricsApi;
@@ -449,6 +492,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		currentThinkingLevel = ctx.thinkingLevel;
 		if (config.settings.metricsEnabled) {
+			await ensureSpeed().then((s) => s?.start(ctx));
 			const m = await ensureMetrics();
 			m.start(ctx);
 		}
@@ -468,6 +512,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("model_select", async (event, ctx) => {
 		if (event.model.provider !== PROVIDER_NAME) {
+			speedApi?.stop(ctx);
 			metricsApi?.stop(ctx);
 			return;
 		}
@@ -478,6 +523,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		metricsApi?.resetForModelSwitch();
 		if (config.settings.metricsEnabled) {
+			await ensureSpeed().then((s) => s?.start(ctx));
 			const m = await ensureMetrics();
 			m.start(ctx);
 		}
@@ -490,6 +536,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		extensionActive = false;
 		stopPolling();
+		speedApi?.stop();
 		metricsApi?.stop();
 		warm?.warmer.dispose();
 		warm?.status.dispose();

@@ -217,6 +217,16 @@ export interface MetricsEndpointDiscovered {
 	format: "prometheus" | "json";
 }
 
+/** Server-side snapshot from the /metrics endpoint (see metrics.ts). */
+export interface ServerMetricsState {
+	/** In-flight requests reported by the server. */
+	processing: number;
+	/** Prompt (prefill) rate in tokens/s over the last poll, if measurable. */
+	promptTps?: number;
+	/** Generation rate in tokens/s over the last poll, if measurable. */
+	genTps?: number;
+}
+
 export type ThemeFg = (color: any, text: string) => string;
 
 export interface CompatProfile {

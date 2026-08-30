@@ -1,14 +1,20 @@
-// Live metrics engine (Prometheus/JSON over HTTP). Self-contained: takes a
-// small deps object describing what it needs from the host extension.
+// Server-side metrics poller: fetches the active endpoint's /metrics (or
+// JSON stats) every poll interval and reports a ServerMetricsState snapshot
+// to the speed tracker (speed.ts), which owns the widget.
+//
+// The widget's live per-token speed comes from client-side stream
+// measurement (speed.ts); this poller only supplements it with what the
+// server reports — e.g. other clients busy on the endpoint while pi is
+// idle. It degrades silently when the server has no --metrics endpoint.
 
-import { debugLog, METRICS_WIDGET_ID, PROVIDER_NAME, shared } from "./core.ts";
+import { debugLog, PROVIDER_NAME, shared } from "./core.ts";
 import { httpGet } from "./scan.ts";
-import type { ExtensionContext, MetricsEndpointDiscovered, ThemeFg } from "./types.ts";
+import type { ExtensionContext, MetricsEndpointDiscovered, ServerMetricsState } from "./types.ts";
 
 const METRICS_CANDIDATE_PATHS = ["/metrics", "/v1/metrics", "/api/v1/metrics", "/stats"];
 const METRICS_FETCH_TIMEOUT_MS = 3000;
-
-const safeFg: ThemeFg = (_color, text) => text;
+/** Retry a failed discovery this long after it first failed. */
+const DISCOVERY_FAIL_COOLDOWN_MS = 60_000;
 
 function isPrometheusFormat(text: string): boolean {
 	const lines = text.split("\n").filter((l) => l.trim().length > 0);
@@ -69,12 +75,12 @@ function counterValue(m: Map<string, number>, names: string[]): number | undefin
 	return undefined;
 }
 
-function buildMetricsLine(
+/** Derive the ServerMetricsState snapshot from raw parsed metrics. */
+function toServerState(
 	raw: Map<string, number>,
 	deltaSec: number,
 	prev: { raw: Map<string, number> } | undefined,
-	fg: ThemeFg,
-): string[] {
+): ServerMetricsState {
 	const promptNow = counterValue(raw, ["prompt_tokens_total"]);
 	const genNow = counterValue(raw, ["predicted_tokens_total", "tokens_predicted_total"]);
 	let promptTps: number | undefined;
@@ -82,45 +88,37 @@ function buildMetricsLine(
 	if (prev && deltaSec > 0) {
 		const promptPrev = counterValue(prev.raw, ["prompt_tokens_total"]);
 		const genPrev = counterValue(prev.raw, ["predicted_tokens_total", "tokens_predicted_total"]);
-		if (promptNow !== undefined && promptPrev !== undefined && promptNow >= promptPrev && promptNow > promptPrev)
+		if (promptNow !== undefined && promptPrev !== undefined && promptNow > promptPrev)
 			promptTps = (promptNow - promptPrev) / deltaSec;
-		if (genNow !== undefined && genPrev !== undefined && genNow >= genPrev && genNow > genPrev)
+		if (genNow !== undefined && genPrev !== undefined && genNow > genPrev)
 			genTps = (genNow - genPrev) / deltaSec;
 	}
+	// Fallback: server-provided average-rate gauges.
 	if (promptTps === undefined) promptTps = raw.get("prompt_tokens_seconds");
 	if (genTps === undefined) genTps = raw.get("predicted_tokens_seconds") ?? raw.get("tokens_predicted_seconds");
-
-	const processing = raw.get("requests_processing") ?? counterValue(raw, ["num_requests_running"]) ?? 0;
-
-	const parts: string[] = [fg("accent", "📊")];
-	if (promptTps !== undefined && promptTps > 0) {
-		const c = promptTps > 500 ? "success" : promptTps > 20 ? "warning" : "muted";
-		parts.push(fg(c, `⚡ ${Math.round(promptTps)} t/s`));
-	}
-	if (genTps !== undefined && genTps > 0) {
-		const c = genTps > 100 ? "success" : genTps > 10 ? "warning" : "muted";
-		parts.push(fg(c, `🔥 ${Math.round(genTps)} t/s`));
-	}
-	if (processing > 0) parts.push(fg("success", `▶ ${processing}`));
-	if (parts.length === 1) parts.push(fg("muted", "⏸ idle"));
-	return [parts.join(" · ")];
+	const processing = Math.round(raw.get("requests_processing") ?? counterValue(raw, ["num_requests_running"]) ?? 0);
+	return {
+		processing,
+		...(promptTps !== undefined && promptTps > 0 ? { promptTps } : {}),
+		...(genTps !== undefined && genTps > 0 ? { genTps } : {}),
+	};
 }
 
 export interface MetricsDeps {
 	/** Whether the extension is still active (post-shutdown guard). */
 	isActive: () => boolean;
-	/** Whether the ctx has a UI (with stale-ctx safety). */
-	hasUI: (ctx: ExtensionContext | undefined) => ctx is ExtensionContext;
 	/** Current poll interval (ms) — read fresh from settings. */
 	pollIntervalMs: () => number;
 	/** Whether the metrics widget is enabled in settings. */
 	enabled: () => boolean;
+	/** Report a server snapshot (null when nothing to report). */
+	onServerState: (ctx: ExtensionContext | undefined, st: ServerMetricsState | null) => void;
 }
 
 export function createMetrics(deps: MetricsDeps) {
 	let timer: ReturnType<typeof setInterval> | undefined;
-	let widgetVisible = false;
 	const endpoints = new Map<string, MetricsEndpointDiscovered>();
+	const discoveryFails = new Map<string, number>();
 	const prev = new Map<string, { raw: Map<string, number>; ts: number }>();
 	let currentKey: string | undefined;
 	let currentBaseUrl: string | undefined;
@@ -144,32 +142,20 @@ export function createMetrics(deps: MetricsDeps) {
 		return undefined;
 	}
 
-	function renderWidget(lines: string[] | undefined, ctx: ExtensionContext) {
-		if (!deps.hasUI(ctx)) return;
-		if (lines === undefined) {
-			if (widgetVisible) {
-				ctx.ui.setWidget(METRICS_WIDGET_ID, undefined);
-				widgetVisible = false;
-			}
-			return;
-		}
-		ctx.ui.setWidget(METRICS_WIDGET_ID, lines, { placement: "belowEditor" });
-		widgetVisible = true;
-	}
-
-	async function poll(ctx: ExtensionContext): Promise<void> {
+	async function poll(ctx: ExtensionContext | undefined): Promise<void> {
 		if (!deps.isActive()) return;
 		try {
-			const model = ctx.model;
+			const model = ctx?.model;
 			if (!deps.enabled() || model?.provider !== PROVIDER_NAME) {
-				renderWidget(undefined, ctx);
 				currentKey = undefined;
+				deps.onServerState(ctx, null);
 				return;
 			}
 
 			const baseUrl = model.baseUrl ?? shared.modelBaseUrls.get(model.id);
 			if (!baseUrl) {
-				renderWidget(undefined, ctx);
+				currentKey = undefined;
+				deps.onServerState(ctx, null);
 				return;
 			}
 			const parsed = new URL(baseUrl);
@@ -177,22 +163,31 @@ export function createMetrics(deps: MetricsDeps) {
 			if (key !== currentKey) {
 				currentKey = key;
 				currentBaseUrl = baseUrl;
-				prev.clear();
+				prev.delete(key);
 			}
 
 			let endpoint = endpoints.get(key);
 			if (!endpoint) {
+				const failedAt = discoveryFails.get(key);
+				if (failedAt !== undefined && Date.now() - failedAt < DISCOVERY_FAIL_COOLDOWN_MS) return;
 				endpoint = await discoverMetricsEndpoint(baseUrl);
-				if (endpoint) endpoints.set(key, endpoint);
+				if (endpoint) {
+					endpoints.set(key, endpoint);
+					discoveryFails.delete(key);
+				} else {
+					discoveryFails.set(key, Date.now());
+					debugLog(`no metrics endpoint for ${key}; retrying in ${DISCOVERY_FAIL_COOLDOWN_MS}ms`);
+				}
 			}
 			if (!endpoint) {
-				renderWidget([safeFg("muted", "📊 no metrics endpoint")], ctx);
+				deps.onServerState(ctx, null);
 				return;
 			}
 
 			const res = await httpGet(endpoint.url, METRICS_FETCH_TIMEOUT_MS);
 			if (res.status < 200 || res.status >= 300) {
-				renderWidget([safeFg("muted", `📊 metrics HTTP ${res.status}`)], ctx);
+				debugLog(`metrics HTTP ${res.status} from ${endpoint.url}`);
+				deps.onServerState(ctx, null);
 				return;
 			}
 			let raw: Map<string, number>;
@@ -201,7 +196,7 @@ export function createMetrics(deps: MetricsDeps) {
 				try {
 					raw = parseJsonMetrics(JSON.parse(res.body));
 				} catch {
-					renderWidget([safeFg("muted", "📊 metrics parse error")], ctx);
+					deps.onServerState(ctx, null);
 					return;
 				}
 			}
@@ -211,18 +206,16 @@ export function createMetrics(deps: MetricsDeps) {
 			const deltaSec = prevSnap ? (now - prevSnap.ts) / 1000 : 0;
 			prev.set(key, { raw, ts: now });
 
-			const fg = deps.hasUI(ctx) ? ((ctx.ui.theme?.fg)?.bind(ctx.ui.theme) ?? safeFg) : safeFg;
-			renderWidget(buildMetricsLine(raw, deltaSec, prevSnap, fg), ctx);
+			deps.onServerState(ctx, toServerState(raw, deltaSec, prevSnap));
 		} catch (err) {
 			if (!deps.isActive()) return;
 			const msg = err instanceof Error ? err.message : String(err);
 			debugLog(`metrics poll failed: ${msg}`);
-			const fg = deps.hasUI(ctx) ? ((ctx.ui.theme?.fg)?.bind(ctx.ui.theme) ?? safeFg) : safeFg;
-			renderWidget([fg("muted", "📊 ⏸ idle")], ctx);
+			deps.onServerState(ctx, null);
 		}
 	}
 
-	function start(ctx: ExtensionContext): void {
+	function start(ctx: ExtensionContext | undefined): void {
 		if (!deps.isActive() || timer) return;
 		void poll(ctx);
 		timer = setInterval(() => {
@@ -236,7 +229,8 @@ export function createMetrics(deps: MetricsDeps) {
 			clearInterval(timer);
 			timer = undefined;
 		}
-		if (ctx) renderWidget(undefined, ctx);
+		currentKey = undefined;
+		deps.onServerState(ctx, null);
 	}
 
 	/** Reset state when the user switches to a different endpoint. */
