@@ -20,6 +20,7 @@ import {
 	shared,
 	supportsThinkingBudget,
 } from "./core.ts";
+import { createLongTimeoutOpenAICompletionsStream } from "./runtime.ts";
 
 export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
@@ -120,6 +121,7 @@ export default function (pi: ExtensionAPI) {
 			baseUrl: `http://${first?.host ?? "127.0.0.1"}:${first?.ports[0] ?? 8080}/v1`,
 			apiKey: first?.apiKey || "no-auth",
 			api: "openai-completions",
+			streamSimple: createLongTimeoutOpenAICompletionsStream,
 			models: [],
 		});
 		providerIsEmpty = true;

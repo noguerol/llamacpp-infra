@@ -25,6 +25,7 @@ Anything else (vLLM, Ollama, cloud APIs…) is out of scope — use pi's built-i
 - **Multi-machine discovery** — configurable list of servers (host, ports, API key, options); probes all of them at startup and on demand
 - **Compact model ids** — models appear as `Name (host:port)` in pi's `/model` picker, like a native provider; the raw GGUF path/alias is sent to the server automatically on every request
 - **Single-model & router modes** — llama.cpp single-model mode (one GGUF per instance) and router mode (multiple models per server, with per-model status and args)
+- **Long local generations** — discovered models are registered with up to **32,768 output tokens** (bounded by the model/server context) and llamacpp-infra OpenAI-compatible requests enforce a **20 minute** timeout floor so slow local runs don't get cut early by pi defaults
 - **Per-model metadata badges** — 👁️ vision (mmproj / modalities), 🚀 drafter (speculative decoding), 🗜️ quant tag from GGUF filename, 🧠 KV cache quantization (from server args or `/proc`)
 - **Live speed & metrics** — a constantly updating footer reading of the active model's prefill (⚡) and generation (🔥) token speed, measured straight from the stream (per token, ~10 updates/s); when pi is idle it also mirrors other clients the server's `/metrics` endpoint reports. Lives in the footer's status line, so no extra terminal row is taken. Works even without `--metrics`
 - **Thinking budgets** — llama.cpp accepts `thinking_budget_tokens` per request; configure budgets per thinking level (minimal/low/medium/high/xhigh/max) per model; models with budgets are registered with reasoning enabled
@@ -223,6 +224,8 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 | `prefixModelIds` | `true` | Append the machine tag `(host:port)` to model ids; OFF keeps bare names and only disambiguates collisions |
 | `showBadgesInNames` | `true` | Append 👁️🚀💤 badges to model display names |
 | `includeUnloadedRouterModels` | `false` | Router mode: list models that are not currently loaded |
+| output cap | `32768` | Registered per model as `maxTokens` unless the server reports an explicit `max_tokens`; still bounded by available context |
+| request timeout | `1200000` | 20 minute timeout floor applied to llamacpp-infra OpenAI-compatible streams |
 | `warmup` | `true` | Pre-cache system prompt KV on llama.cpp servers |
 | `metricsEnabled` | `true` | Show live speed & metrics in the footer for llamacpp-infra models |
 | `metricsPollMs` | `5000` | How often `/metrics` is fetched |

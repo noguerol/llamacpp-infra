@@ -21,6 +21,8 @@ export const LEGACY_CONFIG_FILE = "local-models.json";
 export const METRICS_STATUS_KEY = "llamacpp-infra-speed";
 export const DEFAULT_API_KEY = "no-auth";
 export const THINKING_BUDGET_FIELD = "thinking_budget_tokens";
+export const DEFAULT_MAX_OUTPUT_TOKENS = 32_768;
+export const DEFAULT_PROVIDER_TIMEOUT_MS = 20 * 60 * 1000;
 
 // ── Settings defaults ───────────────────────────────────────────────────────
 export const DEFAULT_SETTINGS: SettingsConfig = {
@@ -28,6 +30,8 @@ export const DEFAULT_SETTINGS: SettingsConfig = {
 	pollIntervalMs: 4000,
 	pollMaxMs: 90_000,
 	startupGraceMs: 40_000,
+	maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
+	requestTimeoutMs: DEFAULT_PROVIDER_TIMEOUT_MS,
 	knownGoodFailLimit: 3,
 	detectVision: true,
 	prefixModelIds: true,

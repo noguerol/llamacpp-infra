@@ -64,6 +64,15 @@ function formatCtx(tokens: number | undefined): string {
 	return tokens >= 1024 ? `${Math.round(tokens / 1024)}k` : `${tokens}`;
 }
 
+function formatTokens(n: number): string {
+	if (!Number.isFinite(n) || n <= 0) return "0";
+	if (n >= 1024) {
+		const k = n / 1024;
+		return Number.isInteger(k) ? `${k}k` : `${k.toFixed(1)}k`;
+	}
+	return `${n}`;
+}
+
 function metadataBadges(m: ModelMetadata | undefined): string {
 	if (!m) return "";
 	const parts: string[] = [];
@@ -662,6 +671,16 @@ async function showSettingsMenu(ctx: ExtensionContext, deps: UiDeps): Promise<vo
 				description: "router mode: list models not currently loaded",
 			},
 			{
+				value: "maxtokens",
+				label: `📏 Max output tokens: ${formatTokens(s.maxOutputTokens)}`,
+				description: "per-model ceiling for outgoing max_tokens requests",
+			},
+			{
+				value: "timeoutfloor",
+				label: `⏱️ Request timeout: ${formatMs(s.requestTimeoutMs)}`,
+				description: "lower bound on OpenAI-completions stream idle timeout",
+			},
+			{
 				value: "warmup",
 				label: `☕ Header warmup: ${s.warmup ? "ON" : "OFF"}`,
 				description: "pre-cache system prompt on llama.cpp-family servers",
@@ -765,6 +784,25 @@ async function showSettingsMenu(ctx: ExtensionContext, deps: UiDeps): Promise<vo
 				saveConfig(config);
 				ctx.ui.notify(`☕ Header warmup ${config.settings.warmup ? "ON" : "OFF"}`, "info");
 				break;
+			case "maxtokens": {
+				const v = await pickNumber("📏 Max output tokens", [4_096, 8_192, 16_384, 24_576, 32_768, 49_152, 65_536]);
+				if (v !== undefined) {
+					config.settings.maxOutputTokens = v;
+					saveConfig(config);
+					ctx.ui.notify(`📏 Max output tokens: ${v.toLocaleString()}`, "info");
+					await deps.rescan(ctx);
+				}
+				break;
+			}
+			case "timeoutfloor": {
+				const v = await pickNumber("⏱️ Request timeout", [60_000, 300_000, 600_000, 1_200_000, 1_800_000, 3_600_000]);
+				if (v !== undefined) {
+					config.settings.requestTimeoutMs = v;
+					saveConfig(config);
+					ctx.ui.notify(`⏱️ Request timeout: ${formatMs(v)}`, "info");
+				}
+				break;
+			}
 			case "reset": {
 				const ok = await ctx.ui.confirm("♻️ Reset settings", "Restore all discovery settings to their defaults?");
 				if (ok) {

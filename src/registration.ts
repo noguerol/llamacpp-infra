@@ -21,6 +21,7 @@ import type {
 	ScanResult,
 } from "./types.ts";
 import { cleanModelName, lmStudioContextLength } from "./scan.ts";
+import { createLongTimeoutOpenAICompletionsStream } from "./runtime.ts";
 
 /** Compact badge string appended to display names when enabled. */
 function badgeSuffix(
@@ -73,7 +74,7 @@ function toPiModel(
 			name: `${displayName}${badgeSuffix(modelMeta, settings.showBadgesInNames)}`,
 			reasoning: false,
 			contextWindow,
-			maxTokens: model.max_tokens ?? Math.min(contextWindow, 8192),
+			maxTokens: model.max_tokens ?? Math.min(contextWindow, settings.maxOutputTokens),
 			compat: makeCompat(kind),
 		};
 	}
@@ -92,7 +93,7 @@ function toPiModel(
 			name: `${displayName}${badgeSuffix(modelMeta, settings.showBadgesInNames)}`,
 			reasoning: ep.props?.capabilities?.reasoning_supported ?? true,
 			contextWindow,
-			maxTokens: model.max_tokens ?? Math.min(contextWindow, 8192),
+			maxTokens: model.max_tokens ?? Math.min(contextWindow, settings.maxOutputTokens),
 			compat: makeCompat(kind),
 		};
 	}
@@ -118,7 +119,7 @@ function toPiModel(
 		name: `${displayName}${badgeSuffix(modelMeta, settings.showBadgesInNames)}`,
 		reasoning: isLlamaFamily,
 		contextWindow,
-		maxTokens: model.max_tokens ?? Math.min(contextWindow, 8192),
+		maxTokens: model.max_tokens ?? Math.min(contextWindow, settings.maxOutputTokens),
 		compat: makeCompat(kind),
 	};
 }
@@ -232,6 +233,7 @@ export function buildAndRegisterProvider(pi: ExtensionAPI, scan: ScanResult, con
 		baseUrl: defaultBaseUrl,
 		apiKey: defaultApiKey,
 		api: "openai-completions",
+		streamSimple: createLongTimeoutOpenAICompletionsStream,
 		models: piModels,
 	});
 

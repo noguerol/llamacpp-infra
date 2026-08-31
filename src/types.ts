@@ -31,6 +31,8 @@ export interface SettingsConfig {
 	pollIntervalMs: number;
 	pollMaxMs: number;
 	startupGraceMs: number;
+	maxOutputTokens: number;
+	requestTimeoutMs: number;
 	knownGoodFailLimit: number;
 	detectVision: boolean;
 	prefixModelIds: boolean;
