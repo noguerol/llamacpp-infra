@@ -225,7 +225,7 @@ export default function (pi: ExtensionAPI) {
 
 	async function rescan(ctx?: ExtensionContext) {
 		if (!extensionActive) return;
-		if (ctxHasUI(ctx)) ctx.ui.setStatus(STATUS_KEY, "🔎 scanning…");
+		if (ctxHasUI(ctx)) ctx.ui.setStatus(STATUS_KEY, "🔎");
 		stopPolling();
 		registerEmptyProvider();
 		const r = await discoverAndRegister();
@@ -237,11 +237,9 @@ export default function (pi: ExtensionAPI) {
 	function updateStatusFooter(ctx?: ExtensionContext) {
 		if (!ctxHasUI(ctx)) return;
 		if (shared.registeredCount > 0) {
-			const up = shared.lastScan?.serversUp ?? 0;
-			const total = shared.lastScan?.serversTotal ?? 0;
-			ctx.ui.setStatus(STATUS_KEY, `🦙 ${shared.registeredCount} models · ${up}/${total} ✓`);
+			ctx.ui.setStatus(STATUS_KEY, `🦙(${shared.registeredCount})`);
 		} else if (shared.lastScan?.endpoints.some((e) => e.loading)) {
-			ctx.ui.setStatus(STATUS_KEY, "⏳ loading…");
+			ctx.ui.setStatus(STATUS_KEY, "⏳");
 		} else if (shared.lastError) {
 			ctx.ui.setStatus(STATUS_KEY, "⚠️");
 		} else {

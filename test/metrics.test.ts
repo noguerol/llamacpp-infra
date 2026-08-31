@@ -90,14 +90,14 @@ const poller = createMetrics({
 
 console.log("metrics poller → tracker (fake /metrics server)");
 tracker.start(ctx);
-check("idle line at start", lines.join() === "📊 · ⏸ idle", lines.join());
+check("idle line at start", lines.join() === "⏸", lines.join());
 
 poller.start(ctx);
 await new Promise((r) => setTimeout(r, 600));
 
 check(
 	"supplement shown while pi idle, server busy",
-	/▶ 2/.test(lines.join()) && /⚡ 150/.test(lines.join()) && /🔥 18\.0/.test(lines.join()) && /server/.test(lines.join()),
+	/▶2/.test(lines.join()) && /⚡ 150 t\/s/.test(lines.join()) && /🔥 18\.0 t\/s/.test(lines.join()),
 	lines.join(),
 );
 
@@ -114,7 +114,7 @@ check(
 // Server goes idle → plain idle line.
 processing = 0;
 await new Promise((r) => setTimeout(r, 800));
-check("plain idle when server idle", lines.join() === "📊 · ⏸ idle", lines.join());
+check("plain idle when server idle", lines.join() === "⏸", lines.join());
 
 poller.stop(ctx);
 await new Promise((r) => setTimeout(r, 100));

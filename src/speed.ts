@@ -6,10 +6,15 @@
 //   prefill t/s  = prompt tokens / (before_provider_request → first token)
 //   gen t/s      = moving window over per-token arrival samples
 //
+// Footer format (kept ultra-compact so it coexists with other extensions on
+// pi's single status line, which is truncated at the end):
+//
+//   ⚡ {prefill} t/s 🔥 {gen} t/s
+//
 // The server-side /metrics polling (metrics.ts) only supplements this:
 // when the client is idle but the server reports other clients processing,
-// their rate is shown. The client measurement works even when the server has
-// no --metrics endpoint.
+// their rate is shown as `▶{n} ⚡ … t/s 🔥 … t/s`. The client measurement
+// works even when the server has no --metrics endpoint.
 
 import { debugLog, METRICS_STATUS_KEY } from "./core.ts";
 import type { AssistantMessageEvent, ExtensionContext, ServerMetricsState, ThemeFg } from "./types.ts";
@@ -126,58 +131,58 @@ export function createSpeedTracker(deps: SpeedDeps) {
 		return tokens / (span / 1000);
 	}
 
-	function buildLine(ctx: ExtensionContext | undefined, now: number): string[] {
+	function buildLine(ctx: ExtensionContext | undefined, now: number): string {
 		const f = fg(ctx);
-		const parts: string[] = [f("accent", "📊")];
+		const parts: string[] = [];
 
 		switch (state) {
 			case "prefill":
-				parts.push(f("warning", "⚡ prefill…"));
+				parts.push(f("warning", "⚡…"));
 				break;
 
 			case "streaming": {
+				// Prefill rate of the previous call (only known once it ended).
+				if (lastPrefillTps !== undefined) {
+					parts.push(f("muted", `⚡ ${Math.round(lastPrefillTps)} t/s`));
+				}
 				const gen = genRateAt(now);
 				if (gen !== undefined) {
 					lastGenTps = gen;
 					parts.push(f(rateColor(gen, "gen"), `🔥 ${formatRate(gen)} t/s`));
 				}
-				if (lastPrefillTps !== undefined) {
-					parts.push(f("muted", `⚡ ${Math.round(lastPrefillTps)}`));
-				}
-				parts.push(f("muted", `${tokenCount} tok`));
 				break;
 			}
 
 			case "done": {
-				if (lastGenTps !== undefined) {
-					parts.push(f("muted", `🔥 ${formatRate(lastGenTps)} t/s`));
-				}
 				if (lastPrefillTps !== undefined) {
-					parts.push(f("muted", `⚡ ${Math.round(lastPrefillTps)}`));
+					parts.push(f(rateColor(lastPrefillTps, "prefill"), `⚡ ${Math.round(lastPrefillTps)} t/s`));
 				}
-				parts.push(f("muted", `${tokenCount} tok`));
+				if (lastGenTps !== undefined) {
+					parts.push(f(rateColor(lastGenTps, "gen"), `🔥 ${formatRate(lastGenTps)} t/s`));
+				}
 				break;
 			}
 
 			case "idle": {
 				// Server supplement: this endpoint is busy for *other* clients.
 				if (server && server.processing > 0) {
-					parts.push(f("success", `▶ ${server.processing}`));
+					parts.push(f("success", `▶${server.processing}`));
 					if (server.promptTps !== undefined && server.promptTps > 0) {
-						parts.push(f(rateColor(server.promptTps, "prefill"), `⚡ ${Math.round(server.promptTps)}`));
+						parts.push(f(rateColor(server.promptTps, "prefill"), `⚡ ${Math.round(server.promptTps)} t/s`));
 					}
 					if (server.genTps !== undefined && server.genTps > 0) {
-						parts.push(f(rateColor(server.genTps, "gen"), `🔥 ${formatRate(server.genTps)}`));
+						parts.push(f(rateColor(server.genTps, "gen"), `🔥 ${formatRate(server.genTps)} t/s`));
 					}
-					parts.push(f("muted", "server"));
 				} else {
-					parts.push(f("muted", "⏸ idle"));
+					parts.push(f("muted", "⏸"));
 				}
 				break;
 			}
 		}
 
-		return [parts.join(" · ")];
+		// A stream is live but no rate is computable yet (first ~300 ms of a call).
+		if (parts.length === 0) parts.push(f("muted", "🔥…"));
+		return parts.join(" ");
 	}
 
 	function render(ctx: ExtensionContext | undefined, now: number, force = false): void {
@@ -186,7 +191,7 @@ export function createSpeedTracker(deps: SpeedDeps) {
 			return;
 		}
 		if (!deps.hasUI(ctx) || !deps.isOurs(ctx)) return;
-		const line = buildLine(ctx, now).join(" · ");
+		const line = buildLine(ctx, now);
 		if (!force && now - lastRenderAt < RENDER_THROTTLE_MS) return;
 		lastRenderAt = now;
 		// No visual change → skip (avoids a full UI re-render on the footer).
