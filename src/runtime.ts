@@ -67,17 +67,24 @@ async function loadOpenAICompletionsStreamSimple(): Promise<StreamSimple> {
 	if (!openAICompletionsStreamPromise) {
 		openAICompletionsStreamPromise = (async () => {
 			try {
-				const mod = await import("@earendil-works/pi-ai/api/openai-completions");
-				return (mod as { streamSimple: StreamSimple }).streamSimple;
+				// pi's extension loader aliases the pi-ai ROOT specifier to the compat
+				// entry (which re-exports openAICompletionsApi), so this import works in
+				// every pi runtime (jiti aliases / virtual modules / tsconfig paths).
+				// Subpath specifiers like "@earendil-works/pi-ai/api/openai-completions"
+				// are NOT aliased and only resolve inside a real node_modules install.
+				const mod = await import("@earendil-works/pi-ai");
+				const streams = (mod as { openAICompletionsApi?: () => { streamSimple: StreamSimple } }).openAICompletionsApi?.();
+				if (typeof streams?.streamSimple === "function") return streams.streamSimple;
 			} catch {
-				// In pi package installs, pi-ai may be nested under pi-coding-agent
-				// instead of hoisted as a top-level dependency of this extension.
-				const piIndexUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
-				const piPackageDir = dirname(dirname(fileURLToPath(piIndexUrl)));
-				const nestedModule = join(piPackageDir, "node_modules", "@earendil-works", "pi-ai", "dist", "api", "openai-completions.js");
-				const mod = await import(pathToFileURL(nestedModule).href);
-				return (mod as { streamSimple: StreamSimple }).streamSimple;
+				// fall through to the nested-module lookup below
 			}
+			// In real pi package installs, pi-ai may be nested under pi-coding-agent
+			// instead of hoisted as a top-level dependency of this extension.
+			const piIndexUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+			const piPackageDir = dirname(dirname(fileURLToPath(piIndexUrl)));
+			const nestedModule = join(piPackageDir, "node_modules", "@earendil-works", "pi-ai", "dist", "api", "openai-completions.js");
+			const nestedMod = await import(pathToFileURL(nestedModule).href);
+			return (nestedMod as { streamSimple: StreamSimple }).streamSimple;
 		})();
 	}
 	return openAICompletionsStreamPromise;
