@@ -21,6 +21,18 @@ pi.md.local
 # punched-memory — never commit project-local memory
 .punched-memory.json
 .punched-memory/
+
+# Credentials & secrets — defense in depth (nothing committed today, guard against accidents)
+.env
+.env.local
+.npmrc
+secrets.json
+*.pem
+*.key
+id_rsa*
+*.p12
+*.p8
+credentials*.json
 # t-plan: plan files are private runtime state — never commit or publish them
 plan_*_[0-9a-zA-Z]*.md
 plan.md
