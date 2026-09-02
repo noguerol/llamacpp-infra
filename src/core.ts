@@ -17,6 +17,7 @@ import type {
 export const PROVIDER_NAME = "llamacpp-infra";
 export const STATUS_KEY = "llamacpp-infra";
 export const CONFIG_FILE = "llamacpp-infra.json";
+export const MODELS_CACHE_FILE = "llamacpp-infra-models.json";
 export const LEGACY_CONFIG_FILE = "local-models.json";
 export const METRICS_STATUS_KEY = "llamacpp-infra-speed";
 export const DEFAULT_API_KEY = "no-auth";
@@ -110,6 +111,130 @@ export function saveConfig(config: InfraConfig): void {
 		debugLog(`config saved to ${getConfigPath()}`);
 	} catch (err) {
 		console.error(`[llamacpp-infra] Config save error: ${err}`);
+	}
+}
+
+// ── Last-known-models cache ────────────────────────────────────────────────
+// Lets a freshly booted pi process register the provider with the models from
+// the previous scan IMMEDIATELY (synchronously, during the extension factory),
+// so CLI consumers that resolve --model at startup (e.g. trimegisto sub-agents
+// spawned as `pi -p --no-session --model provider/model`) find the model before
+// the async discovery re-scan completes. The async scan then refreshes this
+// registration with live data as usual.
+
+const MODELS_CACHE_VERSION = 1;
+
+/** JSON-safe projection of a registered PiModel (no secrets; headers re-derived). */
+interface CachedModelEntry {
+	id: string;
+	name: string;
+	baseUrl: string;
+	reasoning: boolean;
+	input: ("text" | "image")[];
+	contextWindow: number;
+	maxTokens: number;
+	serverModelId: string;
+	endpoint: import("./types.ts").PiModel["endpoint"];
+	thinkingBudgets?: import("./types.ts").ThinkingBudgets;
+	quant?: string;
+	cacheK?: string;
+	cacheV?: string;
+	drafter?: string;
+	routerStatus?: string;
+}
+
+interface ModelsCacheFile {
+	version: number;
+	savedAt: string;
+	models: CachedModelEntry[];
+}
+
+export function getModelsCachePath(): string {
+	return join(getAgentDir(), MODELS_CACHE_FILE);
+}
+
+/** Persist the last successfully registered models for fast boot on next process. */
+export function saveModelsCache(models: import("./types.ts").PiModel[]): void {
+	if (!models || models.length === 0) return;
+	try {
+		const file: ModelsCacheFile = {
+			version: MODELS_CACHE_VERSION,
+			savedAt: new Date().toISOString(),
+			models: models.map((m) => ({
+				id: m.id,
+				name: m.name,
+				baseUrl: m.baseUrl,
+				reasoning: m.reasoning,
+				input: m.input,
+				contextWindow: m.contextWindow,
+				maxTokens: m.maxTokens,
+				serverModelId: m.serverModelId,
+				endpoint: m.endpoint,
+				thinkingBudgets: m.thinkingBudgets,
+				quant: m.quant,
+				cacheK: m.cacheK,
+				cacheV: m.cacheV,
+				drafter: m.drafter,
+				routerStatus: m.routerStatus,
+			})),
+		};
+		const dir = getAgentDir();
+		if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+		writeFileSync(getModelsCachePath(), JSON.stringify(file), "utf-8");
+		debugLog(`models cache saved (${models.length} model(s))`);
+	} catch (err) {
+		console.error(`[llamacpp-infra] Models cache save error: ${err instanceof Error ? err.message : String(err)}`);
+	}
+}
+
+/** Load models cached by a previous scan, or null when absent/corrupt/empty. */
+export function loadModelsCache(): import("./types.ts").PiModel[] | null {
+	try {
+		const path = getModelsCachePath();
+		if (!existsSync(path)) return null;
+		const raw = JSON.parse(readFileSync(path, "utf-8")) as Partial<ModelsCacheFile>;
+		if (raw?.version !== MODELS_CACHE_VERSION || !Array.isArray(raw.models) || raw.models.length === 0) return null;
+		return raw.models.map((c) => ({
+			id: c.id,
+			name: c.name,
+			baseUrl: c.baseUrl,
+			reasoning: c.reasoning,
+			input: Array.isArray(c.input) && c.input.length > 0 ? c.input : (["text"] as ("text" | "image")[]),
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: c.contextWindow,
+			maxTokens: c.maxTokens,
+			compat: makeCompat(c.endpoint?.kind),
+			serverModelId: c.serverModelId,
+			endpoint: c.endpoint,
+			thinkingBudgets: c.thinkingBudgets,
+			quant: c.quant,
+			cacheK: c.cacheK,
+			cacheV: c.cacheV,
+			drafter: c.drafter,
+			routerStatus: c.routerStatus,
+		}));
+	} catch (err) {
+		debugLog(`models cache load failed: ${err instanceof Error ? err.message : String(err)}`);
+		return null;
+	}
+}
+
+/** Rebuild the shared maps (id↔raw, baseUrls, kinds, zinc) from cached models. */
+export function applyCachedSharedState(models: import("./types.ts").PiModel[]): void {
+	shared.zincModelIds.clear();
+	shared.serverModelIds.clear();
+	shared.compactModelIds.clear();
+	shared.endpointKinds.clear();
+	shared.modelBaseUrls.clear();
+	for (const pm of models) {
+		if (pm.endpoint?.kind === "zinc") {
+			shared.zincModelIds.add(pm.id);
+			shared.zincModelIds.add(pm.serverModelId);
+		}
+		shared.serverModelIds.set(pm.id, pm.serverModelId);
+		if (!shared.compactModelIds.has(pm.serverModelId)) shared.compactModelIds.set(pm.serverModelId, pm.id);
+		shared.endpointKinds.set(pm.baseUrl, pm.endpoint?.kind ?? "unknown");
+		shared.modelBaseUrls.set(pm.id, pm.baseUrl);
 	}
 }
 

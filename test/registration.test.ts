@@ -55,7 +55,7 @@ const scan: ScanResult = {
 	],
 };
 
-const models = buildAndRegisterProvider(pi, scan, config);
+const models = buildAndRegisterProvider(pi, scan, config, { persistCache: false });
 const byServerId = new Map(models.map((m) => [m.serverModelId, m]));
 
 check(

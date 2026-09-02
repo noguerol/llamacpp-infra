@@ -9,9 +9,11 @@ import {
 	PROVIDER_NAME,
 	STATUS_KEY,
 	THINKING_BUDGET_FIELD,
+	applyCachedSharedState,
 	compactIdFor,
 	debugLog,
 	loadConfig,
+	loadModelsCache,
 	modelOptions,
 	normalizeLevel,
 	rawIdFor,
@@ -125,6 +127,43 @@ export default function (pi: ExtensionAPI) {
 			models: [],
 		});
 		providerIsEmpty = true;
+	}
+
+	// ── Boot provider registration (synchronous, cache-first) ────────────
+	// Registers models from the last known scan IMMEDIATELY when a cache exists,
+	// so this process can resolve `--model llamacpp-infra/...` at startup without
+	// waiting for the async discovery re-scan (which refreshes right after).
+	// Falls back to the empty "scanning…" provider when there is no cache.
+	function registerBootProvider() {
+		const cached = loadModelsCache();
+		if (cached && cached.length > 0) {
+			try {
+				pi.unregisterProvider(PROVIDER_NAME);
+			} catch {
+				// not registered yet
+			}
+			// Re-derive per-server auth headers (never persisted with the cache).
+			for (const m of cached) {
+				const srv = config.servers.find((s) => s.id === m.endpoint?.serverId && s.host === m.endpoint?.host);
+				if (srv?.apiKey) m.headers = { Authorization: `Bearer ${srv.apiKey}` };
+			}
+			applyCachedSharedState(cached);
+			const bootSrv = config.servers.find((s) => s.id === cached[0].endpoint?.serverId);
+			pi.registerProvider(PROVIDER_NAME, {
+				name: `🦙 llama.cpp-infra (cached ${cached.length}, rescanning…)`,
+				baseUrl: cached[0].baseUrl,
+				apiKey: bootSrv?.apiKey || "no-auth",
+				api: "openai-completions",
+				streamSimple: createLongTimeoutOpenAICompletionsStream,
+				models: cached,
+			});
+			providerIsEmpty = false;
+			shared.registeredCount = cached.length;
+			shared.lastModels = cached;
+			debugLog(`boot: registered ${cached.length} cached model(s); async rescan will refresh`);
+			return;
+		}
+		registerEmptyProvider();
 	}
 
 	async function discoverAndRegister(): Promise<{ scan: import("./types.ts").ScanResult; shouldPoll: boolean }> {
@@ -474,7 +513,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── Initial non-blocking registration ─────────────────────────────────
-	registerEmptyProvider();
+	registerBootProvider();
 	void discoverAndRegister()
 		.then((r) => {
 			if (extensionActive) schedulePolling(r.shouldPoll);

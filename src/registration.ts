@@ -9,6 +9,7 @@ import {
 	makeCompat,
 	modelOptions,
 	saveConfig,
+	saveModelsCache,
 	shared,
 } from "./core.ts";
 import type { ExtensionAPI } from "./types.ts";
@@ -128,7 +129,12 @@ function toPiModel(
  * Build pi models from a scan and (re)register the provider.
  * Returns the registered model list.
  */
-export function buildAndRegisterProvider(pi: ExtensionAPI, scan: ScanResult, config: InfraConfig): PiModel[] {
+export function buildAndRegisterProvider(
+	pi: ExtensionAPI,
+	scan: ScanResult,
+	config: InfraConfig,
+	options?: { persistCache?: boolean },
+): PiModel[] {
 	shared.zincModelIds.clear();
 	shared.serverModelIds.clear();
 	shared.compactModelIds.clear();
@@ -236,6 +242,12 @@ export function buildAndRegisterProvider(pi: ExtensionAPI, scan: ScanResult, con
 		streamSimple: createLongTimeoutOpenAICompletionsStream,
 		models: piModels,
 	});
+
+	// Persist the last known good models so a fresh pi process can register them
+	// synchronously at boot (before async discovery completes) — required for CLI
+	// consumers that resolve --model right after startup (e.g. trimegisto spawns).
+	// Tests opt out so they never touch the real per-user cache.
+	if (piModels.length > 0 && options?.persistCache !== false) saveModelsCache(piModels);
 
 	return piModels;
 }
