@@ -96,6 +96,16 @@ export function normalizeSettings(raw: unknown): SettingsConfig {
 	return s;
 }
 
+/** True if two servers would collide on the same (host, port) endpoint. */
+export function serversShareEndpoint(
+	a: Pick<import("./types.ts").ServerConfig, "host" | "ports">,
+	b: Pick<import("./types.ts").ServerConfig, "host" | "ports">,
+): boolean {
+	if (a.host !== b.host) return false;
+	const aPorts = new Set(a.ports);
+	return b.ports.some((p) => aPorts.has(p));
+}
+
 function normalizeServer(s: Record<string, unknown>): import("./types.ts").ServerConfig {
 	return {
 		id: String(s.id ?? "local"),
