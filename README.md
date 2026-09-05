@@ -286,11 +286,12 @@ Every assistant message therefore carries a realistic `usage.cost.total`: pi's o
 ### Setup
 
 ```
-/llamacpp-infra config  →  💰 Energy cost
+/llamacpp-infra config  →  💰 Energy cost      (global: currency, master toggle)
+/llamacpp-infra config  →  🌐 Servers → machine → 💰 Energy cost   (per machine)
 ```
 
-1. **Currency** — USD, EUR, GBP or CNY. It only changes the display unit; tariffs are stored per kWh in that currency.
-2. **Per-server power draw & tariff** — the power draw belongs to the *machine*, so every server (machine) gets one profile: `kW` during inference (e.g. `0.15` for 150 W — GPU TDP + idle draw is a good approximation) and the electricity price per kWh. All models served by that machine inherit it.
+1. **Currency** (global) — USD, EUR, GBP or CNY. It only changes the display unit; tariffs are stored per kWh in that currency.
+2. **Per-server power draw & tariff** — the power draw belongs to the *machine*, so each server gets its own profile inside its own config menu (`🌐 Servers` → select the machine → `💰 Energy cost`; adding a new server asks for it right away). Set `kW` during inference (e.g. `0.15` for 150 W — GPU TDP + idle draw is a good approximation) and the electricity price per kWh. All models served by that machine inherit it.
 
 Once set, each provider request is timed (`before_provider_request` → assistant `message_end`, partial/aborted requests included) and charged. The footer shows the session total as `💰` (e.g. `💰3.2c` = 3.2 euro-cents; `¢`/`c`/`p`/`分` per currency); enable/disable anytime from the same menu.
 

@@ -7,6 +7,7 @@ import {
 	modelOptions,
 	saveConfig,
 	serverLabel,
+	serversShareEndpoint,
 	shared,
 } from "./core.ts";
 import type {
@@ -225,7 +226,7 @@ export async function showConfigMenu(ctx: ExtensionContext, deps: UiDeps): Promi
 			{
 				value: "cost",
 				label: `💰 Energy cost: ${config.settings.costTracking ? "ON" : "OFF"}`,
-				description: `currency ${currencySymbol(config.settings.currency)} · ${config.servers.filter((s) => s.costProfile && s.costProfile.kW > 0).length} server(s) with kW`,
+				description: `currency ${currencySymbol(config.settings.currency)} · kW/tariff per server under 🌐 Servers`,
 			},
 			{
 				value: "metrics",
@@ -333,6 +334,11 @@ async function showServerMenu(ctx: ExtensionContext, srv: ServerConfig, deps: Ui
 				label: srv.apiKey ? "🔑 API key: set" : "🔑 API key: none",
 				description: srv.apiKey ? "clear or replace bearer token" : "optional",
 			},
+			{
+				value: "cost",
+				label: srv.costProfile?.kW ? `💰 Energy cost: ${formatProfile(srv.costProfile, config.settings.currency)}` : "💰 Energy cost: not set",
+				description: "power draw during inference (kW) + electricity tariff",
+			},
 			{ value: "test", label: "🧪 Test this server", description: `probe ${srv.ports.length} port(s) now` },
 			{ value: "delete", label: "🗑️ Delete server", description: "remove from configuration" },
 			{ value: "__back", label: "← Back", description: "" },
@@ -346,6 +352,15 @@ async function showServerMenu(ctx: ExtensionContext, srv: ServerConfig, deps: Ui
 				const trimmed = host.trim();
 				if (!trimmed) {
 					ctx.ui.notify("❌ Host cannot be empty", "error");
+					break;
+				}
+				const dup = config.servers.find((s) => s.id !== srv.id && serversShareEndpoint(s, { host: trimmed, ports: srv.ports }));
+				if (dup) {
+					const sharedPorts = srv.ports.filter((p) => dup.ports.includes(p)).join(", ");
+					ctx.ui.notify(
+						`⚠️ Server "${serverLabel(dup)}" already probes ${trimmed}:${sharedPorts} — pick a different host`,
+						"warning",
+					);
 					break;
 				}
 				srv.host = trimmed;
@@ -409,6 +424,10 @@ async function showServerMenu(ctx: ExtensionContext, srv: ServerConfig, deps: Ui
 				}
 				break;
 			}
+			case "cost": {
+				await showServerCostMenu(ctx, srv, config);
+				break;
+			}
 			case "test": {
 				ctx.ui.setStatus("llamacpp-infra", "🧪 testing…");
 				const localServers = config.settings.detectVision ? scanLocalServers() : new Map();
@@ -460,15 +479,20 @@ async function addServerFlow(ctx: ExtensionContext, deps: UiDeps): Promise<void>
 		ctx.ui.notify("❌ Host cannot be empty", "error");
 		return;
 	}
-	if (config.servers.some((s) => s.host === trimmedHost)) {
-		ctx.ui.notify(`⚠️ A server with host "${trimmedHost}" already exists`, "warning");
-		return;
-	}
 	const portsRaw = await ctx.ui.input("➕ Ports to probe", "e.g. 1234, 8000, 8080-8082");
 	if (portsRaw === undefined) return;
 	const ports = parsePorts(portsRaw);
 	if (!ports) {
 		ctx.ui.notify("❌ No valid ports in input", "error");
+		return;
+	}
+	const dup = config.servers.find((s) => serversShareEndpoint(s, { host: trimmedHost, ports }));
+	if (dup) {
+		const sharedPorts = ports.filter((p) => dup.ports.includes(p)).join(", ");
+		ctx.ui.notify(
+			`⚠️ Server "${serverLabel(dup)}" already probes ${trimmedHost}:${sharedPorts} — use different ports`,
+			"warning",
+		);
 		return;
 	}
 	const label = await ctx.ui.input("🏷️ Label (optional)", trimmedHost);
@@ -486,6 +510,12 @@ async function addServerFlow(ctx: ExtensionContext, deps: UiDeps): Promise<void>
 	saveConfig(config);
 	ctx.ui.notify(`➕ Server added: ${label.trim() || trimmedHost} (${trimmedHost}) — ports ${ports.join(", ")}`, "info");
 	await deps.rescan(ctx);
+
+	// Per-machine energy cost: offered right after adding, since it belongs to
+	// the machine's own configuration (also editable later under 🌐 Servers).
+	const srv = config.servers.find((s) => s.id === id)!;
+	const wantCost = await ctx.ui.confirm("💰 Energy cost?", "Set this machine's power draw (kW) and tariff to estimate electricity cost of local inference?");
+	if (wantCost) await showServerCostMenu(ctx, srv, config);
 }
 
 // ── Thinking budgets ───────────────────────────────────────────────────────
@@ -646,8 +676,8 @@ async function showCostMenu(ctx: ExtensionContext, deps: UiDeps): Promise<void> 
 			},
 			{
 				value: "servers",
-				label: "🖥️ Per-server kW / tariff",
-				description: `${withKw.length} server(s) configured`,
+				label: "🖥️ Per-server kW / tariff…",
+				description: `${withKw.length} configured — edit under 🌐 Servers → machine`,
 			},
 			{ value: "__back", label: "← Back", description: "" },
 		]);
@@ -668,33 +698,22 @@ async function showCostMenu(ctx: ExtensionContext, deps: UiDeps): Promise<void> 
 			}
 		}
 		else if (action === "servers") {
-			await showServerCostMenu(ctx, config);
+			await showServersMenu(ctx, deps);
 		}
 	}
 }
 
-async function showServerCostMenu(ctx: ExtensionContext, config: NonNullable<typeof shared.activeConfig>): Promise<void> {
+/** Per-machine energy cost (kW + tariff). Lives inside the server's own menu. */
+async function showServerCostMenu(ctx: ExtensionContext, srv: ServerConfig, config: NonNullable<typeof shared.activeConfig>): Promise<void> {
 	for (;;) {
-		const items = config.servers.map((srv) => ({
-			value: srv.id,
-			label: `${srv.costProfile?.kW ? "💰" : "·"} ${serverLabel(srv)}`,
-			description: srv.costProfile?.kW ? formatProfile(srv.costProfile, config.settings.currency) : `${srv.host} — no kW set`,
-		}));
-		items.push({ value: "__back", label: "← Back", description: "" });
-		const picked = await selectFrom(ctx, "💰 Per-server energy cost — select a machine", items);
-		if (!picked || picked === "__back") return;
-		const srv = config.servers.find((s) => s.id === picked);
-		if (!srv) return;
-
 		const p = srv.costProfile;
-		const sub = await selectFrom(ctx, `💰 ${serverLabel(srv)} (${srv.host})`, [
-			{ value: "kW", label: p?.kW ? `⚡ Power draw: ${p.kW} kW` : "⚡ Set power draw (kW)", description: "W consumed during inference (e.g. 0.15 for 150 W)" },
+		const sub = await selectFrom(ctx, `💰 ${serverLabel(srv)} — energy cost`, [
+			{ value: "kW", label: p?.kW ? `⚡ Power draw: ${p.kW} kW` : "⚡ Set power draw (kW)", description: "watts consumed during inference, e.g. 0.15 for 150 W" },
 			{ value: "rate", label: p?.ratePerKwh ? `🧾 Tariff: ${p.ratePerKwh} ${currencySymbol(config.settings.currency)}/kWh` : `🧾 Set tariff (${currencySymbol(config.settings.currency)}/kWh)`, description: "electricity price per kWh" },
-			{ value: "label", label: p?.label ? `🏷️ Label: ${p.label}` : "🏷️ Set label", description: "optional, shown in menus" },
-			...(p?.kW ? [{ value: "clear", label: "🗑️ Remove cost profile", description: "stop estimating cost for this machine" }] : []),
+			...(p?.kW || p?.ratePerKwh ? [{ value: "clear", label: "🗑️ Remove cost profile", description: "stop estimating cost for this machine" }] : []),
 			{ value: "__back", label: "← Back", description: "" },
 		]);
-		if (!sub || sub === "__back") continue;
+		if (!sub || sub === "__back") return;
 
 		if (sub === "kW") {
 			const raw = await ctx.ui.input("⚡ Power draw in kW (e.g. 0.15 = 150 W)", p?.kW ? String(p.kW) : "0.15");
@@ -711,13 +730,6 @@ async function showServerCostMenu(ctx: ExtensionContext, config: NonNullable<typ
 			srv.costProfile = { ...(srv.costProfile ?? { kW: 0.15 }), ratePerKwh: rate };
 			saveConfig(config);
 			ctx.ui.notify(`🧾 ${serverLabel(srv)}: ${rate} ${currencySymbol(config.settings.currency)}/kWh`, "info");
-		}
-		else if (sub === "label") {
-			const raw = await ctx.ui.input("🏷️ Label", p?.label ?? "");
-			if (raw !== undefined) {
-				srv.costProfile = { ...(srv.costProfile ?? { kW: 0.15, ratePerKwh: 0.21 }), label: raw.trim() || undefined };
-				saveConfig(config);
-			}
 		}
 		else if (sub === "clear") {
 			delete srv.costProfile;
