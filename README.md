@@ -28,6 +28,7 @@ Anything else (vLLM, Ollama, cloud APIs…) is out of scope — use pi's built-i
 - **Long local generations** — discovered models are registered with up to **32,768 output tokens** (bounded by the model/server context) and llamacpp-infra OpenAI-compatible requests enforce a **20 minute** timeout floor so slow local runs don't get cut early by pi defaults
 - **Per-model metadata badges** — 👁️ vision (mmproj / modalities), 🚀 drafter (speculative decoding), 🗜️ quant tag from GGUF filename, 🧠 KV cache quantization (from server args or `/proc`)
 - **Live speed & metrics** — a constantly updating footer reading of the active model's prefill (⚡) and generation (🔥) token speed, measured straight from the stream (per token, ~10 updates/s); when pi is idle it also mirrors other clients the server's `/metrics` endpoint reports. Lives in the footer's status line, so no extra terminal row is taken. Works even without `--metrics`
+- **Energy cost (💰)** — local models report no per-token cost, so llamacpp-infra estimates the **electricity** the inference consumed: configure each machine's power draw (kW) and tariff (per kWh) once, and every assistant message carries a realistic `usage.cost.total` (kW × €/kWh × measured request time) — pi's native cost footer, session stats and any consumer reading usage (e.g. trimegisto agents) all show it. Currency selector: USD / EUR / GBP / CNY
 - **Thinking budgets** — llama.cpp accepts `thinking_budget_tokens` per request; configure budgets per thinking level (minimal/low/medium/high/xhigh/max) per model; models with budgets are registered with reasoning enabled
 - **Header warmup** — pre-caches the system prompt KV on llama.cpp-family servers so the first real request is faster
 - **LM Studio support** — uses LM Studio's OpenAI-compatible `/v1` API, enriches names/context/quant/vision from `/api/v1/models` (or legacy `/api/v0/models`), and avoids llama.cpp-only request fields
@@ -160,7 +161,8 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
       "label": "Local",
       "ports": [8000, 8001, 8002, 8080, 8081, 8082, 1234],
       "enabled": true,
-      "probeDs4": false
+      "probeDs4": false,
+      "costProfile": { "kW": 0.15, "ratePerKwh": 0.21, "label": "bruma 27B" }
     },
     {
       "id": "myserver",
@@ -184,7 +186,9 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
     "includeUnloadedRouterModels": false,
     "warmup": true,
     "metricsEnabled": true,
-    "metricsPollMs": 5000
+    "metricsPollMs": 5000,
+    "currency": "eur",
+    "costTracking": true
   },
   "modelOptions": {
     "Qwen3.6-27B (myserver:8080)": {
@@ -210,6 +214,7 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 | `enabled` | `true` | Whether to probe this server |
 | `probeDs4` | `false` | Opt-in: ping `/v1/chat/completions` for DwarfStar/ds4 servers |
 | `apiKey` | — | Optional bearer token sent on discovery and per-model requests |
+| `costProfile` | — | `{ kW, ratePerKwh }` energy-cost profile for this machine; enables 💰 estimation (see [Energy Cost](#energy-cost-)) |
 
 ### Settings
 
@@ -229,6 +234,8 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 | `warmup` | `true` | Pre-cache system prompt KV on llama.cpp servers |
 | `metricsEnabled` | `true` | Show live speed & metrics in the footer for llamacpp-infra models |
 | `metricsPollMs` | `5000` | How often `/metrics` is fetched |
+| `currency` | `eur` | Display currency for energy costs: `usd` / `eur` / `gbp` / `cny` |
+| `costTracking` | `true` | Accumulate 💰 energy cost and inject it into `usage.cost.total` |
 
 ### Thinking budgets
 
@@ -258,12 +265,48 @@ When enabled, the speed reading appears in the footer's status line (no extra te
 🦙(12) ⚡ 420 t/s 🔥 38.1 t/s  (just after the answer ends)
 🦙(12) ⏸             (between turns)
 🦙(12) ▶2 ⚡ 150 t/s 🔥 18.0 t/s  (pi idle, server busy for other clients)
+🦙(12) ⏸ 💰3.2c      (energy cost of this session, after a turn)
 ```
 
 (`🦙(n)` is the extension's model-count status; both live on the same footer line, so no extra row is consumed.)
 
 - **Client measurement (always, no `--metrics` needed)** — prefill speed = `prompt tokens ÷ (request → first token)` (pi's `usage.input`, OpenAI-style `prompt_tokens` as fallback); generation speed = a moving 1.5 s window over per-token arrival samples. Updated ~every 100 ms while a stream is live (throttled, and unchanged text is skipped, so the footer never churns).
 - **Server supplement (only when pi is idle)** — the poller fetches the server's Prometheus `/metrics` endpoint (or JSON `/stats`) every `metricsPollMs` (default 5 s). If the server reports other clients processing, their ⚡/🔥 rates are shown (`▶n`); when the server is idle, the plain `⏸` reading returns.
+
+## Energy Cost (💰)
+
+Cloud providers report their own per-message cost, so pi's native cost footer is always right for them. Local llama.cpp-family servers report nothing — so llamacpp-infra estimates the **electricity** the inference consumed and feeds it into the standard usage pipeline:
+
+```
+cost = (requestMs / 3_600_000) × kW × tariff
+```
+
+Every assistant message therefore carries a realistic `usage.cost.total`: pi's own cost display/session stats show it, and any consumer that reads usage (e.g. **trimegisto** sub-agents, which accumulate `usage.cost.total` per message into their dashboard) gets it for free — no per-tool cost logic needed anywhere else.
+
+### Setup
+
+```
+/llamacpp-infra config  →  💰 Energy cost
+```
+
+1. **Currency** — USD, EUR, GBP or CNY. It only changes the display unit; tariffs are stored per kWh in that currency.
+2. **Per-server power draw & tariff** — the power draw belongs to the *machine*, so every server (machine) gets one profile: `kW` during inference (e.g. `0.15` for 150 W — GPU TDP + idle draw is a good approximation) and the electricity price per kWh. All models served by that machine inherit it.
+
+Once set, each provider request is timed (`before_provider_request` → assistant `message_end`, partial/aborted requests included) and charged. The footer shows the session total as `💰` (e.g. `💰3.2c` = 3.2 euro-cents; `¢`/`c`/`p`/`分` per currency); enable/disable anytime from the same menu.
+
+> **Parallel agents & accuracy** — when several clients hammer the same server in parallel, each client's wall time is the server time it actually consumed (decode is interleaved), so the session total approximates the machine's inference energy. Good for cost visibility; not a metering-grade measurement.
+
+Config lives in `~/.pi/agent/llamacpp-infra.json`:
+
+```json
+{
+  "servers": [
+    { "id": "local", "host": "127.0.0.1", "ports": [8000, 8080, 8081], "enabled": true,
+      "costProfile": { "kW": 0.15, "ratePerKwh": 0.21, "label": "bruma 27B" } }
+  ],
+  "settings": { "currency": "eur", "costTracking": true }
+}
+```
 
 ## Architecture
 
@@ -280,6 +323,8 @@ llamacpp-infra/
     ├── registration.ts  # Scan → pi-model mapping + provider registration (lazy).
     ├── metrics.ts       # Server /metrics poller → ServerMetricsState (lazy; only if `metricsEnabled`).
     ├── speed.ts         # Client-side speed tracker + footer status line (lazy; only if `metricsEnabled`).
+    ├── cost.ts          # Cost profiles, currency formatting, energy math (static import; tiny).
+    ├── cost-tracker.ts  # Energy-cost tracker: times requests, accumulates, feeds usage.cost (static).
     ├── ui.ts            # /llamacpp-infra subcommands, menus, status, help (lazy).
     └── prompt-warmup.ts # Header warmup: capture + cache system prompt KV (lazy; only if `warmup`).
 ```
@@ -292,6 +337,7 @@ Module load profile:
 | `scan.ts` + `registration.ts` | First discovery (dynamic) | ~27 KB |
 | `prompt-warmup.ts` | Primed at load if `warmup` enabled; not loaded when disabled | ~15 KB; skipped entirely when `warmup` is OFF |
 | `metrics.ts` + `speed.ts` | Primed at load if `metricsEnabled`; not loaded when disabled | ~18 KB; skipped entirely when `metricsEnabled` is OFF |
+| `cost.ts` + `cost-tracker.ts` | Static at load (tiny; needed in sub-agent processes too, which never fire `session_start`) | ~4 KB |
 | `ui.ts` | First `/llamacpp-infra …` command (dynamic) | ~32 KB |
 
 Zero external npm dependencies (only pi's bundled `@earendil-works/pi-coding-agent` + Node built-ins).

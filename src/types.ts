@@ -2,6 +2,24 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+export type Currency = "usd" | "eur" | "gbp" | "cny";
+
+/**
+ * Energy-cost profile for one machine: power draw during inference (kW) and
+ * electricity tariff (per kWh, in the configured currency). Cost of a request
+ * = (ms / 3_600_000) × kW × ratePerKwh. `host`/`pattern` refine matching when
+ * needed (they are optional; the serverId association is the primary key).
+ */
+export interface CostProfile {
+	label?: string;
+	/** Power draw during inference, in kilowatts. 0/absent = estimation off. */
+	kW: number;
+	/** Electricity tariff per kWh (in the configured currency). */
+	ratePerKwh: number;
+	host?: string;
+	pattern?: string;
+}
+
 /** One machine that may serve llama.cpp-family models on one or more ports. */
 export interface ServerConfig {
 	id: string;
@@ -11,6 +29,8 @@ export interface ServerConfig {
 	enabled: boolean;
 	probeDs4?: boolean;
 	apiKey?: string;
+	/** Energy-cost profile for this machine (kW + tariff). */
+	costProfile?: CostProfile;
 }
 
 /** Thinking budget (tokens) per pi thinking level, llama.cpp-style. */
@@ -41,6 +61,10 @@ export interface SettingsConfig {
 	metricsPollMs: number;
 	includeUnloadedRouterModels: boolean;
 	showBadgesInNames: boolean;
+	/** Display currency for energy costs (default: eur). */
+	currency: Currency;
+	/** Whether the footer shows accumulated energy cost (default: true). */
+	costTracking: boolean;
 }
 
 export interface InfraConfig {

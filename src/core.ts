@@ -20,6 +20,7 @@ export const CONFIG_FILE = "llamacpp-infra.json";
 export const MODELS_CACHE_FILE = "llamacpp-infra-models.json";
 export const LEGACY_CONFIG_FILE = "local-models.json";
 export const METRICS_STATUS_KEY = "llamacpp-infra-speed";
+export const COST_STATUS_KEY = "llamacpp-infra-cost";
 export const DEFAULT_API_KEY = "no-auth";
 export const THINKING_BUDGET_FIELD = "thinking_budget_tokens";
 export const DEFAULT_MAX_OUTPUT_TOKENS = 32_768;
@@ -41,6 +42,8 @@ export const DEFAULT_SETTINGS: SettingsConfig = {
 	metricsPollMs: 5000,
 	includeUnloadedRouterModels: false,
 	showBadgesInNames: true,
+	currency: "eur",
+	costTracking: true,
 };
 
 export const DEFAULT_SERVERS: ServerConfig[] = [
@@ -65,6 +68,50 @@ export function getConfigPath(): string {
 	return join(getAgentDir(), CONFIG_FILE);
 }
 
+/** Validate/normalize a raw cost profile from disk. */
+export function parseCostProfile(raw: unknown): import("./types.ts").CostProfile | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const r = raw as Record<string, unknown>;
+	const kW = typeof r.kW === "number" ? r.kW : parseFloat(String(r.kW ?? ""));
+	const rate = typeof r.ratePerKwh === "number" ? r.ratePerKwh : parseFloat(String(r.ratePerKwh ?? ""));
+	if (!Number.isFinite(kW) || kW <= 0 || !Number.isFinite(rate) || rate <= 0) return undefined;
+	const p: import("./types.ts").CostProfile = { kW, ratePerKwh: rate };
+	if (typeof r.label === "string" && r.label) p.label = r.label;
+	if (typeof r.host === "string" && r.host) p.host = r.host;
+	if (typeof r.pattern === "string" && r.pattern) p.pattern = r.pattern;
+	return p;
+}
+
+const CURRENCY_CODES = new Set(["usd", "eur", "gbp", "cny"]);
+
+/** Normalize a raw settings object onto the defaults (unknown keys dropped, bad values repaired). */
+export function normalizeSettings(raw: unknown): SettingsConfig {
+	const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+	const s: SettingsConfig = { ...DEFAULT_SETTINGS };
+	for (const key of Object.keys(DEFAULT_SETTINGS) as Array<keyof SettingsConfig>) {
+		const v = r[key];
+		if (typeof v === typeof DEFAULT_SETTINGS[key]) (s as Record<string, unknown>)[key] = v;
+	}
+	if (typeof r.currency === "string" && CURRENCY_CODES.has(r.currency as string)) s.currency = r.currency as SettingsConfig["currency"];
+	return s;
+}
+
+function normalizeServer(s: Record<string, unknown>): import("./types.ts").ServerConfig {
+	return {
+		id: String(s.id ?? "local"),
+		host: String(s.host ?? "127.0.0.1"),
+		...(typeof s.label === "string" && s.label ? { label: s.label } : {}),
+		ports: Array.isArray(s.ports) ? s.ports.filter((p): p is number => typeof p === "number") : [],
+		enabled: typeof s.enabled === "boolean" ? s.enabled : true,
+		...(s.probeDs4 === true ? { probeDs4: true } : {}),
+		...(typeof s.apiKey === "string" && s.apiKey ? { apiKey: s.apiKey } : {}),
+		...(() => {
+			const p = parseCostProfile(s.costProfile);
+			return p ? { costProfile: p } : {};
+		})(),
+	};
+}
+
 export function loadConfig(): InfraConfig {
 	const defaults: InfraConfig = {
 		servers: DEFAULT_SERVERS,
@@ -76,8 +123,10 @@ export function loadConfig(): InfraConfig {
 		try {
 			const raw = JSON.parse(readFileSync(path, "utf-8")) as Partial<InfraConfig>;
 			return {
-				servers: Array.isArray(raw.servers) ? raw.servers : defaults.servers,
-				settings: { ...DEFAULT_SETTINGS, ...(raw.settings ?? {}) },
+				servers: Array.isArray(raw.servers)
+					? raw.servers.map((s) => normalizeServer(s as Record<string, unknown>))
+					: defaults.servers,
+				settings: normalizeSettings(raw.settings),
 				modelOptions: raw.modelOptions ?? {},
 			};
 		} catch (err) {
@@ -90,8 +139,10 @@ export function loadConfig(): InfraConfig {
 		try {
 			const raw = JSON.parse(readFileSync(legacyPath, "utf-8")) as Partial<InfraConfig>;
 			const migrated: InfraConfig = {
-				servers: Array.isArray(raw.servers) ? raw.servers : defaults.servers,
-				settings: { ...DEFAULT_SETTINGS, ...(raw.settings ?? {}) },
+				servers: Array.isArray(raw.servers)
+					? raw.servers.map((s) => normalizeServer(s as Record<string, unknown>))
+					: defaults.servers,
+				settings: normalizeSettings(raw.settings),
 				modelOptions: raw.modelOptions ?? {},
 			};
 			debugLog(`migrated legacy config from ${legacyPath}`);

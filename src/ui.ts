@@ -19,6 +19,7 @@ import type {
 	ThinkingBudgets,
 } from "./types.ts";
 import { fetchModelsFromEndpoint, scanLocalServers } from "./scan.ts";
+import { CURRENCIES, formatProfile, currencySymbol } from "./cost.ts";
 
 // ── Small UI helpers ───────────────────────────────────────────────────────
 async function selectFrom<T>(
@@ -222,6 +223,11 @@ export async function showConfigMenu(ctx: ExtensionContext, deps: UiDeps): Promi
 			{ value: "test", label: "🧪 Test connectivity", description: "probe every endpoint and show latency" },
 			{ value: "budgets", label: "🧠 Thinking budgets", description: `${budgetCount} model(s) with budgets` },
 			{
+				value: "cost",
+				label: `💰 Energy cost: ${config.settings.costTracking ? "ON" : "OFF"}`,
+				description: `currency ${currencySymbol(config.settings.currency)} · ${config.servers.filter((s) => s.costProfile && s.costProfile.kW > 0).length} server(s) with kW`,
+			},
+			{
 				value: "metrics",
 				label: `📈 Live speed & metrics: ${config.settings.metricsEnabled ? "ON" : "OFF"}`,
 				description: `per-token speed · server poll ${formatMs(config.settings.metricsPollMs)}`,
@@ -247,6 +253,9 @@ export async function showConfigMenu(ctx: ExtensionContext, deps: UiDeps): Promi
 				break;
 			case "budgets":
 				await showThinkingBudgetsMenu(ctx, deps);
+				break;
+			case "cost":
+				await showCostMenu(ctx, deps);
 				break;
 			case "metrics":
 				await showMetricsMenu(ctx, deps);
@@ -615,6 +624,105 @@ async function showMetricsMenu(ctx: ExtensionContext, deps: UiDeps): Promise<voi
 				deps.restartMetricsPolling(ctx);
 				ctx.ui.notify(`🔁 Metrics poll interval: ${formatMs(v)}`, "info");
 			}
+		}
+	}
+}
+
+// ── Energy-cost menu ────────────────────────────────────────────────────
+async function showCostMenu(ctx: ExtensionContext, deps: UiDeps): Promise<void> {
+	const config = shared.activeConfig!;
+	for (;;) {
+		const withKw = config.servers.filter((s) => s.costProfile && s.costProfile.kW > 0);
+		const action = await selectFrom(ctx, `💰 Energy cost (${currencySymbol(config.settings.currency)})`, [
+			{
+				value: "toggle",
+				label: config.settings.costTracking ? "🔴 Disable cost tracking" : "🟢 Enable cost tracking",
+				description: "accumulate electricity cost of local inference (footer + usage.cost)",
+			},
+			{
+				value: "currency",
+				label: `💱 Currency: ${CURRENCIES.find((c) => c.code === config.settings.currency)?.label ?? config.settings.currency}`,
+				description: "display unit for costs and tariffs",
+			},
+			{
+				value: "servers",
+				label: "🖥️ Per-server kW / tariff",
+				description: `${withKw.length} server(s) configured`,
+			},
+			{ value: "__back", label: "← Back", description: "" },
+		]);
+		if (action === undefined || action === "__back") return;
+
+		if (action === "toggle") {
+			config.settings.costTracking = !config.settings.costTracking;
+			saveConfig(config);
+			deps.updateStatusFooter(ctx);
+			ctx.ui.notify(`💰 Cost tracking: ${config.settings.costTracking ? "ON" : "OFF"}`, "info");
+		}
+		else if (action === "currency") {
+			const cur = await selectFrom(ctx, "💱 Select currency", CURRENCIES.map((c) => ({ value: c.code, label: c.label })));
+			if (cur) {
+				config.settings.currency = cur;
+				saveConfig(config);
+				ctx.ui.notify(`💱 Currency: ${CURRENCIES.find((c) => c.code === cur)?.label}`, "info");
+			}
+		}
+		else if (action === "servers") {
+			await showServerCostMenu(ctx, config);
+		}
+	}
+}
+
+async function showServerCostMenu(ctx: ExtensionContext, config: NonNullable<typeof shared.activeConfig>): Promise<void> {
+	for (;;) {
+		const items = config.servers.map((srv) => ({
+			value: srv.id,
+			label: `${srv.costProfile?.kW ? "💰" : "·"} ${serverLabel(srv)}`,
+			description: srv.costProfile?.kW ? formatProfile(srv.costProfile, config.settings.currency) : `${srv.host} — no kW set`,
+		}));
+		items.push({ value: "__back", label: "← Back", description: "" });
+		const picked = await selectFrom(ctx, "💰 Per-server energy cost — select a machine", items);
+		if (!picked || picked === "__back") return;
+		const srv = config.servers.find((s) => s.id === picked);
+		if (!srv) return;
+
+		const p = srv.costProfile;
+		const sub = await selectFrom(ctx, `💰 ${serverLabel(srv)} (${srv.host})`, [
+			{ value: "kW", label: p?.kW ? `⚡ Power draw: ${p.kW} kW` : "⚡ Set power draw (kW)", description: "W consumed during inference (e.g. 0.15 for 150 W)" },
+			{ value: "rate", label: p?.ratePerKwh ? `🧾 Tariff: ${p.ratePerKwh} ${currencySymbol(config.settings.currency)}/kWh` : `🧾 Set tariff (${currencySymbol(config.settings.currency)}/kWh)`, description: "electricity price per kWh" },
+			{ value: "label", label: p?.label ? `🏷️ Label: ${p.label}` : "🏷️ Set label", description: "optional, shown in menus" },
+			...(p?.kW ? [{ value: "clear", label: "🗑️ Remove cost profile", description: "stop estimating cost for this machine" }] : []),
+			{ value: "__back", label: "← Back", description: "" },
+		]);
+		if (!sub || sub === "__back") continue;
+
+		if (sub === "kW") {
+			const raw = await ctx.ui.input("⚡ Power draw in kW (e.g. 0.15 = 150 W)", p?.kW ? String(p.kW) : "0.15");
+			const kW = parseFloat(raw ?? "");
+			if (isNaN(kW) || kW <= 0) { ctx.ui.notify("❌ Invalid kW", "error"); continue; }
+			srv.costProfile = { ...(srv.costProfile ?? { ratePerKwh: 0.2 }), kW };
+			saveConfig(config);
+			ctx.ui.notify(`⚡ ${serverLabel(srv)}: ${kW} kW`, "info");
+		}
+		else if (sub === "rate") {
+			const raw = await ctx.ui.input(`🧾 Tariff in ${currencySymbol(config.settings.currency)}/kWh (e.g. 0.21)`, p?.ratePerKwh ? String(p.ratePerKwh) : "0.21");
+			const rate = parseFloat(raw ?? "");
+			if (isNaN(rate) || rate <= 0) { ctx.ui.notify("❌ Invalid tariff", "error"); continue; }
+			srv.costProfile = { ...(srv.costProfile ?? { kW: 0.15 }), ratePerKwh: rate };
+			saveConfig(config);
+			ctx.ui.notify(`🧾 ${serverLabel(srv)}: ${rate} ${currencySymbol(config.settings.currency)}/kWh`, "info");
+		}
+		else if (sub === "label") {
+			const raw = await ctx.ui.input("🏷️ Label", p?.label ?? "");
+			if (raw !== undefined) {
+				srv.costProfile = { ...(srv.costProfile ?? { kW: 0.15, ratePerKwh: 0.21 }), label: raw.trim() || undefined };
+				saveConfig(config);
+			}
+		}
+		else if (sub === "clear") {
+			delete srv.costProfile;
+			saveConfig(config);
+			ctx.ui.notify(`🗑️ ${serverLabel(srv)}: cost profile removed`, "info");
 		}
 	}
 }

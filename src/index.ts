@@ -23,6 +23,8 @@ import {
 	supportsThinkingBudget,
 } from "./core.ts";
 import { createLongTimeoutOpenAICompletionsStream } from "./runtime.ts";
+import { resolveCostProfile } from "./cost.ts";
+import { createCostTracker, type CostTracker } from "./cost-tracker.ts";
 
 export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
@@ -77,6 +79,28 @@ export default function (pi: ExtensionAPI) {
 	let metricsApi: ReturnType<MetricsModule["createMetrics"]> | undefined;
 	let speedApi: ReturnType<SpeedModule["createSpeedTracker"]> | undefined;
 
+	/**
+	 * Energy-cost tracker. Created SYNCHRONOUSLY at factory time (not lazily
+	 * like the speed tracker) because cost must be measured inside sub-agent
+	 * processes too (`pi -p --no-session`), which never fire session_start:
+	 * the message_end hook needs it on the very first LLM call. Gating is done
+	 * via deps.enabled(), so toggling costTracking ON at runtime works.
+	 */
+	const costApi: CostTracker = createCostTracker({
+			isActive: () => extensionActive,
+			hasUI: ctxHasUI,
+			isOurs: (ctx) => {
+				try {
+					return ctx?.model?.provider === PROVIDER_NAME;
+				} catch {
+					return false;
+				}
+			},
+			enabled: () => config.settings.costTracking,
+			currency: () => config.settings.currency,
+			profileFor: (ctx) => costProfileFor(ctx),
+		});
+
 	// ── Internal state ────────────────────────────────────────────────────
 	let lastSignature: string | undefined;
 	let pollTimer: ReturnType<typeof setTimeout> | undefined;
@@ -101,6 +125,25 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	const epKey = (host: string, port: number) => `${host}:${port}`;
+
+	/** Cost profile for the model a ctx is currently talking to (null = no estimation). */
+	function costProfileFor(ctx: ExtensionContext | undefined): import("./types.ts").CostProfile | null {
+		try {
+			const m = ctx?.model as { id?: string; provider?: string } | undefined;
+			if (!m?.id) return null;
+			const baseUrl = shared.modelBaseUrls.get(m.id);
+			const ep = shared.lastScan?.endpoints.find((e) => e.baseUrl === baseUrl);
+			return resolveCostProfile(
+				{
+					id: m.id,
+					endpoint: ep ? { serverId: ep.serverId, host: ep.host, port: ep.port } : undefined,
+				},
+				config.servers,
+			);
+		} catch {
+			return null;
+		}
+	}
 
 	function safeSystemPrompt(ctx: { getSystemPrompt?: () => string }): string | undefined {
 		try {
@@ -309,9 +352,10 @@ export default function (pi: ExtensionAPI) {
 		if (config.settings.metricsEnabled) metricsApi.start(ctx);
 	}
 
-	// ── Live speed: per-call prefill timing (before id rewrite) ──────────
+	// ── Live speed + energy cost: per-call timing (before id rewrite) ─────
 	pi.on("before_provider_request", (_event, ctx) => {
 		speedApi?.onRequest(ctx, Date.now());
+		costApi?.onRequest(ctx, Date.now());
 		return undefined;
 	});
 
@@ -322,6 +366,21 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("message_end", (event, ctx) => {
 		speedApi?.onMessageEnd(ctx, event.message, Date.now());
+
+		// Inject the energy cost of THIS request into usage.cost.total so pi's
+		// native cost footer, session stats and any consumer reading usage
+		// (e.g. trimegisto agents, which accumulate usage.cost.total per
+		// message) see a realistic cost for local models. message_end fires
+		// before persistence, so mutating event.message in place is enough.
+		const msg = event.message as { role?: string; usage?: { cost?: { total?: number } } } | undefined;
+		if (msg?.role === "assistant" && config.settings.costTracking) {
+			const requestCost = costApi?.onMessageEnd(ctx, event.message, Date.now()) ?? 0;
+			if (requestCost > 0 && msg.usage?.cost) {
+				msg.usage.cost.total = (msg.usage.cost.total ?? 0) + requestCost;
+				return { message: event.message };
+			}
+		}
+		return undefined;
 	});
 
 	pi.on("turn_end", (_event, ctx) => {
@@ -530,10 +589,15 @@ export default function (pi: ExtensionAPI) {
 			w.warmer.warmupForModel(ctx.model, safeSystemPrompt(ctx), ctx.cwd);
 		}
 		currentThinkingLevel = ctx.thinkingLevel;
-		if (config.settings.metricsEnabled) {
-			await ensureSpeed().then((s) => s?.start(ctx));
-			const m = await ensureMetrics();
-			m.start(ctx);
+		try {
+			if (config.settings.metricsEnabled) {
+				await ensureSpeed().then((s) => s?.start(ctx));
+				const m = await ensureMetrics();
+				m.start(ctx);
+			}
+		} catch (err) {
+			// Tracking must never break session start (or spam the TUI with traces).
+			debugLog(`session_start tracking error ignored: ${err instanceof Error ? err.message : String(err)}`);
 		}
 		if (!ctxHasUI(ctx)) return;
 		void discoverAndRegister()
@@ -561,10 +625,16 @@ export default function (pi: ExtensionAPI) {
 			w.warmer.warmupForModel(event.model, safeSystemPrompt(ctx), ctx.cwd);
 		}
 		metricsApi?.resetForModelSwitch();
-		if (config.settings.metricsEnabled) {
-			await ensureSpeed().then((s) => s?.start(ctx));
-			const m = await ensureMetrics();
-			m.start(ctx);
+		costApi?.reset(ctx);
+		try {
+			if (config.settings.metricsEnabled) {
+				await ensureSpeed().then((s) => s?.start(ctx));
+				const m = await ensureMetrics();
+				m.start(ctx);
+			}
+		} catch (err) {
+			// Tracking must never break model switches (or spam the TUI with traces).
+			debugLog(`model_select tracking error ignored: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	});
 
